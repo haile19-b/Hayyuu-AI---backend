@@ -1,8 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 from app.core.env import settings
-# from app.routes.index import router
 
 app = FastAPI(
     title="My API",
@@ -30,3 +30,7 @@ async def health_check():
         "success": True,
         "message": "API is running 🚀",
     }
+
+
+if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=settings.PORT, reload=True)
