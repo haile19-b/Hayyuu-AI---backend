@@ -1,8 +1,22 @@
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from prisma import Prisma
 
-from app.core.env import settings
+# Global prisma client instance
+db = Prisma()
 
-engine = create_engine(settings.DATABASE_URL)
+async def connect_db():
+    """Call this on FastAPI startup"""
+    if not db.is_connected():
+        await db.connect()
 
-SessionLocal = sessionmaker(bind=engine)
+async def disconnect_db():
+    """Call this on FastAPI shutdown"""
+    if db.is_connected():
+        await db.disconnect()
+
+# FastAPI Dependency Injection
+async def get_db():
+    """
+    Yields the database client instance.
+    No need to open/close connection per request (Prisma handles connection pooling internally).
+    """
+    yield db

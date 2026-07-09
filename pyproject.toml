@@ -8,6 +8,7 @@ dependencies = [
     "alembic>=1.18.5",
     "email-validator>=2.3.0",
     "fastapi>=0.139.0",
+    "prisma>=0.15.0",
     "psycopg[binary]>=3.3.4",
     "pwdlib>=0.3.0",
     "pydantic-settings>=2.14.2",
