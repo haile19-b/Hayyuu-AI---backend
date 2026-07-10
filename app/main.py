@@ -5,6 +5,7 @@ import uvicorn
 
 from app.core.env import settings
 from app.core.database import connect_db, disconnect_db
+from app.interfaces.api.v1.routes import route as api_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,7 +33,7 @@ app.add_middleware(
 )
 
 # Register all application routes
-# app.include_router(router, prefix="/api")
+app.include_router(api_router, prefix="/api/v1")
 
 
 @app.get("/")
