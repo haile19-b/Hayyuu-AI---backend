@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 from app.domain.entities.auth.auth_schema import ApiResponse, RegisterRequest, LoginRequest, RefreshRequest, TokenData, UserProfile
 from app.domain.entities.auth.auth_controller import AuthController
+from app.middleware.auth_middleware import auth_middleware
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -17,13 +18,5 @@ async def refresh(body: RefreshRequest):
     return await AuthController.refresh(body)
 
 @router.get("/me", response_model=ApiResponse[UserProfile])
-async def get_me(user = Depends(AuthController.get_current_user)):
-    return ApiResponse(
-        success=True,
-        data=UserProfile(
-            id=user.id,
-            email=user.email,
-            createdAt=user.createdAt,
-            updatedAt=user.updatedAt
-        )
-    )
+async def get_me(credentials = Depends(auth_middleware)):
+    return await AuthController.me(credentials)
