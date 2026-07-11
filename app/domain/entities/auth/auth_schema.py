@@ -5,24 +5,17 @@ T = TypeVar("T")
 
 class ApiResponse(BaseModel, Generic[T]):
     success: bool
-    data: Optional[T] = None
+    response: Optional[T] = None
+    message: Optional[str] = None
     error: Optional[str] = None
 
 class RegisterRequest(BaseModel):
-    FullName: str = Field(
-        ...,
-        min_length=3,
-        max_length=50
-    )
-    UserName: str = Field(
-        default=None,
-        min_length=3,
-        max_length=50
-    )
+    fullName: str = Field(..., min_length=3, max_length=50)
+    userName: str = Field(default=None, min_length=3, max_length=50)
     email: EmailStr
     password: str
 
-    @field_validator("FullName")
+    @field_validator("fullName")
     @classmethod
     def validate_father_name(cls, v: str) -> str:
         if len(v.strip().split()) < 2:
@@ -31,26 +24,30 @@ class RegisterRequest(BaseModel):
 
     @model_validator(mode="after")
     def set_default_username(self) -> "RegisterRequest":
-        if not self.UserName and self.FullName:
-            self.UserName = self.FullName.strip().split()[0]
+        if not self.userName and self.fullName:
+            self.userName = self.fullName.strip().split()[0]
         return self
 
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
 
-class TokenData(BaseModel):
-    access_token: str
-    refresh_token: str
-    token_type: str = "bearer"
-
 class RefreshRequest(BaseModel):
-    refresh_token: str
+    refreshToken: str
+
+class AuthResponseData(BaseModel):
+    username: str
+    email: str
+    fullName: str
+    accessToken: str
+    refreshToken: str
+    sessionId: str
+
+class RefreshResponseData(BaseModel):
+    accessToken: str
+    refreshToken: str
 
 class UserProfile(BaseModel):
     username: str
     email: str
     fullName: str
-    billingPlan: str
-    storageUsed: str
-    storageQuota: str

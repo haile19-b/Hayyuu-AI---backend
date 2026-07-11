@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
-from jose import jwt, JWTError
+from jose import jwt
 from pwdlib import PasswordHash
 from app.core.env import settings
 
@@ -14,21 +14,17 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, hashed: str) -> bool:
     return password_hash.verify(password, hashed)
 
-def create_token(data: dict, expires_delta: timedelta) -> str:
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + expires_delta
+def sign_access_token(payload: dict) -> str:
+    to_encode = payload.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=15)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, settings.JWT_SECRET, algorithm=ALGORITHM)
 
-def create_access_token(user_id: str) -> str:
-    return create_token({"sub": user_id, "type": "access"}, timedelta(minutes=15))
+def sign_refresh_token(payload: dict) -> str:
+    to_encode = payload.copy()
+    expire = datetime.now(timezone.utc) + timedelta(days=7)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, settings.JWT_SECRET, algorithm=ALGORITHM)
 
-def create_refresh_token(user_id: str) -> str:
-    return create_token({"sub": user_id, "type": "refresh"}, timedelta(days=7))
-
-def decode_token(token: str) -> Dict[str, Any]:
-    try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise ValueError("Invalid token")
+def verify_token(token: str) -> Dict[str, Any]:
+    return jwt.decode(token, settings.JWT_SECRET, algorithms=[ALGORITHM])

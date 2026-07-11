@@ -8,61 +8,123 @@ generator client {
   recursive_type_depth = 5
 }
 
+enum ProjectStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+enum DocumentStatus {
+  PENDING
+  INDEXED
+  FAILED
+}
+
+enum RequirementStatus {
+  DRAFT
+  SUGGESTION
+  APPROVED
+  REJECTED
+}
+
+enum RequirementPriority {
+  P0
+  P1
+  P2
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+  BLOCKED
+}
+
+enum TaskPriority {
+  P0
+  P1
+  P2
+}
+
+enum SuggestionStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
 model User {
   id             String    @id @default(uuid())
   email          String    @unique
   hashedPassword String
   fullName       String
   userName       String
+  githubToken    String?   // Stores encrypted GitHub access token
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
   projects       Project[]
+  sessions       Session[]
 
-  @@map("users") // Maps model name to lowercase table name
+  @@map("users")
 }
 
+model Session {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  expiresAt DateTime
+  userAgent String?
+  ip        String?
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("sessions")
+}
+
+
+
 model Project {
-  id           String        @id @default(uuid())
+  id           String         @id @default(uuid())
   userId       String
   name         String
   description  String?
-  status       String        @default("active") // "active", "archived"
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-  owner        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status       ProjectStatus  @default(ACTIVE)
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  owner        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   documents    Document[]
   requirements Requirement[]
   tasks        Task[]
+  suggestions  AISuggestion[]
 
   @@map("projects")
 }
 
 model Document {
-  id         String   @id @default(uuid())
+  id         String         @id @default(uuid())
   projectId  String
   name       String
   filePath   String
   fileType   String
   sizeBytes  Int
-  status     String   @default("pending") // "pending", "indexed", "failed"
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  status     DocumentStatus @default(PENDING)
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+  project    Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@map("documents")
 }
 
 model Requirement {
-  id           String   @id @default(uuid())
+  id           String              @id @default(uuid())
   projectId    String
   title        String
   description  String
-  priority     String   @default("P2") // "P0", "P1", "P2"
-  status       String   @default("draft") // "draft", "approved"
-  isConflicted Boolean  @default(false)
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  priority     RequirementPriority @default(P2)
+  status       RequirementStatus   @default(DRAFT)
+  isConflicted Boolean             @default(false)
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  project      Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
   tasks        Task[]
 
   @@map("requirements")
@@ -74,8 +136,8 @@ model Task {
   requirementId  String?
   title          String
   description    String
-  priority       String       @default("P2")
-  status         String       @default("todo") // "todo", "in_progress", "done", "blocked"
+  priority       TaskPriority @default(P2)
+  status         TaskStatus   @default(TODO)
   githubIssueUrl String?
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
@@ -83,4 +145,17 @@ model Task {
   requirement    Requirement? @relation(fields: [requirementId], references: [id], onDelete: SetNull)
 
   @@map("tasks")
+}
+
+model AISuggestion {
+  id        String           @id @default(uuid())
+  projectId String
+  type      String           // "requirement", "task", "conflict_resolution"
+  content   Json             // Dynamic JSON payload for the suggestion details
+  status    SuggestionStatus @default(PENDING)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("ai_suggestions")
 }

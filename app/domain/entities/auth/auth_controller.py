@@ -1,61 +1,78 @@
+from fastapi import Request
 from app.domain.entities.auth.auth_services import AuthServices
-from app.domain.entities.auth.jwt import decode_token, create_access_token, create_refresh_token
-from app.domain.entities.auth.auth_schema import ApiResponse, TokenData
+from app.domain.entities.auth.auth_schema import ApiResponse
 
 class AuthController:
     @staticmethod
-    async def register(body):
+    async def register(body, request: Request):
         try:
-            await AuthServices.register_user(
+            ip = request.client.host if request.client else None
+            user_agent = request.headers.get("user-agent")
+            
+            result = await AuthServices.register(
                 email=body.email,
                 password_raw=body.password,
-                full_name=body.FullName,
-                user_name=body.UserName
+                user_name=body.userName,
+                full_name=body.fullName,
+                ip=ip,
+                user_agent=user_agent
             )
-            return ApiResponse(success=True, data="User registered successfully")
-        except ValueError as e:
-            return ApiResponse(success=False, error=str(e))
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     @staticmethod
-    async def login(body):
+    async def login(body, request: Request):
         try:
-            user = await AuthServices.authenticate_user(body.email, body.password)
-            access = create_access_token(user.id)
-            refresh = create_refresh_token(user.id)
-            return ApiResponse(
-                success=True,
-                data=TokenData(access_token=access, refresh_token=refresh)
+            ip = request.client.host if request.client else None
+            user_agent = request.headers.get("user-agent")
+            
+            result = await AuthServices.login(
+                email=body.email,
+                password_raw=body.password,
+                ip=ip,
+                user_agent=user_agent
             )
-        except ValueError as e:
-            return ApiResponse(success=False, error=str(e))
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     @staticmethod
     async def refresh(body):
         try:
-            payload = decode_token(body.refresh_token)
-            if payload.get("type") != "refresh":
-                return ApiResponse(success=False, error="Invalid token type")
-            user_id = payload.get("sub")
-            access = create_access_token(user_id)
-            refresh = create_refresh_token(user_id)
-            return ApiResponse(
-                success=True,
-                data=TokenData(access_token=access, refresh_token=refresh)
-            )
-        except Exception:
-            return ApiResponse(success=False, error="Invalid refresh token")
+            result = await AuthServices.refresh(body.refreshToken)
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def logout(body):
+        try:
+            result = await AuthServices.logout(body.refreshToken)
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def logout_all(credentials: dict):
+        try:
+            user_id = credentials.get("id") if credentials else None
+            if not user_id:
+                return {"success": False, "error": "Unauthorized"}
+                
+            result = await AuthServices.logout_all(user_id)
+            return result
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     @staticmethod
     async def me(credentials: dict):
         try:
-            user_id = credentials.get("sub")
+            user_id = credentials.get("id") if credentials else None
             if not user_id:
-                return ApiResponse(success=False, error="Unauthorized")
-            
-            result = await AuthServices.get_profile(user_id)
-            if not result["success"]:
-                return ApiResponse(success=False, error=result["error"])
+                return {"success": False, "error": "Unauthorized"}
                 
-            return ApiResponse(success=True, data=result["response"])
+            result = await AuthServices.get_profile(user_id)
+            return result
         except Exception as e:
-            return ApiResponse(success=False, error=str(e))
+            return {"success": False, "error": str(e)}

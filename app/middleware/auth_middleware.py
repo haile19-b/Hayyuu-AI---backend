@@ -1,5 +1,5 @@
 from fastapi import Request, HTTPException, status
-from app.domain.entities.auth.jwt import decode_token
+from app.domain.entities.auth.jwt import verify_token
 
 async def auth_middleware(request: Request):
     # 1. Try to get token from Authorization: Bearer <token> header
@@ -21,9 +21,9 @@ async def auth_middleware(request: Request):
 
     try:
         # Decode and verify JWT
-        decoded = decode_token(token)
-        return decoded  # This returns the payload (e.g. {"sub": userId, "type": "access"})
-    except ValueError:
+        decoded = verify_token(token)
+        return decoded  # This returns the payload (e.g. {"id": userId})
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token"
