@@ -1,7 +1,17 @@
 import datetime
-from typing import Optional
+from typing import Optional, Any
 from pydantic import BaseModel, Field
-from prisma.enums import ProjectStatus
+from prisma.enums import (
+    ProjectStatus,
+    DocumentStatus,
+    RequirementStatus,
+    RequirementPriority,
+    TaskStatus,
+    TaskPriority,
+    TaskSource,
+    TaskApprovalStatus,
+    SuggestionStatus
+)
 from app.domain.entities.auth.auth_schema import ApiResponse
 
 class CreateProjectRequest(BaseModel):
@@ -19,6 +29,63 @@ class ProjectResponse(BaseModel):
     name: str
     description: Optional[str] = None
     status: ProjectStatus
+    createdAt: datetime.datetime
+    updatedAt: datetime.datetime
+
+    class Config:
+        from_attributes = True
+
+class DocumentResponse(BaseModel):
+    id: str
+    projectId: str
+    name: str
+    filePath: str
+    fileType: str
+    sizeBytes: int
+    status: DocumentStatus
+    createdAt: datetime.datetime
+    updatedAt: datetime.datetime
+
+    class Config:
+        from_attributes = True
+
+class RequirementResponse(BaseModel):
+    id: str
+    projectId: str
+    title: str
+    description: str
+    priority: RequirementPriority
+    status: RequirementStatus
+    isConflicted: bool
+    createdAt: datetime.datetime
+    updatedAt: datetime.datetime
+
+    class Config:
+        from_attributes = True
+
+class TaskResponse(BaseModel):
+    id: str
+    projectId: str
+    requirementId: Optional[str] = None
+    title: str
+    description: str
+    priority: TaskPriority
+    status: TaskStatus
+    source: TaskSource
+    approvalStatus: TaskApprovalStatus
+    githubIssueUrl: Optional[str] = None
+    createdAt: datetime.datetime
+    updatedAt: datetime.datetime
+
+    class Config:
+        from_attributes = True
+
+class AISuggestionResponse(BaseModel):
+    id: str
+    projectId: str
+    type: str
+    content: Any  # Handles dynamic JSON payload
+    status: SuggestionStatus
     createdAt: datetime.datetime
     updatedAt: datetime.datetime
 

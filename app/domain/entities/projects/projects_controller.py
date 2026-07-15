@@ -68,3 +68,55 @@ class ProjectsController:
             )
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def get_project_documents(project_id: str, credentials: dict) -> dict:
+        try:
+            user_id = credentials.get("id") if credentials else None
+            if not user_id:
+                return {"success": False, "error": "Unauthorized"}
+            return await ProjectsService.get_project_documents(
+                project_id=project_id,
+                user_id=user_id
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def get_project_requirements(project_id: str, credentials: dict) -> dict:
+        try:
+            user_id = credentials.get("id") if credentials else None
+            if not user_id:
+                return {"success": False, "error": "Unauthorized"}
+            return await ProjectsService.get_project_requirements(
+                project_id=project_id,
+                user_id=user_id
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def get_project_tasks(project_id: str, credentials: dict) -> dict:
+        try:
+            user_id = credentials.get("id") if credentials else None
+            if not user_id:
+                return {"success": False, "error": "Unauthorized"}
+            return await ProjectsService.get_project_tasks(
+                project_id=project_id,
+                user_id=user_id
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def get_project_suggestions(project_id: str, credentials: dict) -> dict:
+        try:
+            user_id = credentials.get("id") if credentials else None
+            if not user_id:
+                return {"success": False, "error": "Unauthorized"}
+            return await ProjectsService.get_project_suggestions(
+                project_id=project_id,
+                user_id=user_id
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}

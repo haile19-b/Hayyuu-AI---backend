@@ -107,3 +107,83 @@ class ProjectsService:
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def get_project_documents(project_id: str, user_id: str) -> dict:
+        try:
+            # Verify ownership
+            project = await prisma.project.find_unique(where={"id": project_id})
+            if not project:
+                return {"success": False, "error": "Project not found"}
+            if project.userId != user_id:
+                return {"success": False, "error": "Unauthorized"}
+
+            documents = await prisma.document.find_many(
+                where={"projectId": project_id}
+            )
+            return {
+                "success": True,
+                "response": documents
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def get_project_requirements(project_id: str, user_id: str) -> dict:
+        try:
+            # Verify ownership
+            project = await prisma.project.find_unique(where={"id": project_id})
+            if not project:
+                return {"success": False, "error": "Project not found"}
+            if project.userId != user_id:
+                return {"success": False, "error": "Unauthorized"}
+
+            requirements = await prisma.requirement.find_many(
+                where={"projectId": project_id}
+            )
+            return {
+                "success": True,
+                "response": requirements
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def get_project_tasks(project_id: str, user_id: str) -> dict:
+        try:
+            # Verify ownership
+            project = await prisma.project.find_unique(where={"id": project_id})
+            if not project:
+                return {"success": False, "error": "Project not found"}
+            if project.userId != user_id:
+                return {"success": False, "error": "Unauthorized"}
+
+            tasks = await prisma.task.find_many(
+                where={"projectId": project_id}
+            )
+            return {
+                "success": True,
+                "response": tasks
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    async def get_project_suggestions(project_id: str, user_id: str) -> dict:
+        try:
+            # Verify ownership
+            project = await prisma.project.find_unique(where={"id": project_id})
+            if not project:
+                return {"success": False, "error": "Project not found"}
+            if project.userId != user_id:
+                return {"success": False, "error": "Unauthorized"}
+
+            suggestions = await prisma.aisuggestion.find_many(
+                where={"projectId": project_id}
+            )
+            return {
+                "success": True,
+                "response": suggestions
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
