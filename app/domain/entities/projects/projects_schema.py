@@ -6,6 +6,7 @@ from prisma.enums import (
     DocumentStatus,
     RequirementStatus,
     RequirementPriority,
+    RequirementType,
     TaskStatus,
     TaskPriority,
     TaskSource,
@@ -54,6 +55,7 @@ class RequirementResponse(BaseModel):
     projectId: str
     title: str
     description: str
+    type: RequirementType
     priority: RequirementPriority
     status: RequirementStatus
     isConflicted: bool
