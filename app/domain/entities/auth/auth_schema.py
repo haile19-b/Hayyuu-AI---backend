@@ -15,13 +15,6 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
 
-    @field_validator("fullName")
-    @classmethod
-    def validate_father_name(cls, v: str) -> str:
-        if len(v.strip().split()) < 2:
-            raise ValueError("Father Name missed")
-        return v
-
     @model_validator(mode="after")
     def set_default_username(self) -> "RegisterRequest":
         if not self.userName and self.fullName:

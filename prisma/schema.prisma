@@ -51,6 +51,33 @@ enum SuggestionStatus {
   REJECTED
 }
 
+enum TaskSource {
+  USER
+  SYSTEM
+}
+
+enum TaskApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum RequirementType {
+  FUNCTIONAL
+  NON_FUNCTIONAL
+}
+
+enum ConflictSeverity {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum ConflictStatus {
+  ACTIVE
+  RESOLVED
+}
+
 model User {
   id             String    @id @default(uuid())
   email          String    @unique
@@ -83,18 +110,19 @@ model Session {
 
 
 model Project {
-  id           String         @id @default(uuid())
+  id           String                @id @default(uuid())
   userId       String
   name         String
   description  String?
-  status       ProjectStatus  @default(ACTIVE)
-  createdAt    DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
-  owner        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  status       ProjectStatus         @default(ACTIVE)
+  createdAt    DateTime              @default(now())
+  updatedAt    DateTime              @updatedAt
+  owner        User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
   documents    Document[]
   requirements Requirement[]
   tasks        Task[]
   suggestions  AISuggestion[]
+  conflicts    RequirementConflict[]
 
   @@map("projects")
 }
@@ -119,6 +147,7 @@ model Requirement {
   projectId    String
   title        String
   description  String
+  type         RequirementType     @default(FUNCTIONAL)
   priority     RequirementPriority @default(P2)
   status       RequirementStatus   @default(DRAFT)
   isConflicted Boolean             @default(false)
@@ -126,23 +155,27 @@ model Requirement {
   updatedAt    DateTime            @updatedAt
   project      Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
   tasks        Task[]
+  conflicts    RequirementConflict[] @relation("RequirementConflicts")
+  conflictedBy RequirementConflict[] @relation("ConflictingRequirements")
 
   @@map("requirements")
 }
 
 model Task {
-  id             String       @id @default(uuid())
+  id             String             @id @default(uuid())
   projectId      String
   requirementId  String?
   title          String
   description    String
-  priority       TaskPriority @default(P2)
-  status         TaskStatus   @default(TODO)
+  priority       TaskPriority       @default(P2)
+  status         TaskStatus         @default(TODO)
+  source         TaskSource         @default(USER)
+  approvalStatus TaskApprovalStatus @default(APPROVED)
   githubIssueUrl String?
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-  project        Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  requirement    Requirement? @relation(fields: [requirementId], references: [id], onDelete: SetNull)
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  project        Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  requirement    Requirement?       @relation(fields: [requirementId], references: [id], onDelete: SetNull)
 
   @@map("tasks")
 }
@@ -158,4 +191,24 @@ model AISuggestion {
   project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@map("ai_suggestions")
+}
+
+model RequirementConflict {
+  id                       String           @id @default(uuid())
+  projectId                String
+  requirementId            String
+  conflictingRequirementId String
+  severity                 ConflictSeverity @default(MEDIUM)
+  description              String
+  aiRecommendation         String?
+  status                   ConflictStatus   @default(ACTIVE)
+  createdAt                DateTime         @default(now())
+  updatedAt                DateTime         @updatedAt
+
+  project                  Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  requirement              Requirement      @relation("RequirementConflicts", fields: [requirementId], references: [id], onDelete: Cascade)
+  conflictingRequirement   Requirement      @relation("ConflictingRequirements", fields: [conflictingRequirementId], references: [id], onDelete: Cascade)
+
+  @@unique([requirementId, conflictingRequirementId])
+  @@map("requirement_conflicts")
 }
