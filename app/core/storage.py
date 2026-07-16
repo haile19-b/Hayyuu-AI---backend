@@ -12,6 +12,7 @@ class StorageUtility:
             endpoint_url=settings.STORAGE_ENDPOINT_URL,
             aws_access_key_id=settings.STORAGE_ACCESS_KEY_ID,
             aws_secret_access_key=settings.STORAGE_SECRET_ACCESS_KEY,
+            region_name="us-east-1",
             config=Config(signature_version="s3v4"),
         )
         self.bucket_name = settings.STORAGE_BUCKET_NAME
