@@ -30,7 +30,7 @@ async def disconnect_redis() -> None:
         redis_pool = None
         logger.info("🛑 Redis Pool Disconnected Successfully")
 
-from app.domain.entities.documents.documents_workflow import run_workflow
+from app.agents.requirements_extractor.graph import run_workflow
 
 async def enqueue_document_analysis(document_id: str, project_id: str) -> None:
     """Enqueue a document analysis background job."""

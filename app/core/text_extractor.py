@@ -2,7 +2,8 @@ import logging
 from io import BytesIO
 import docx
 from pypdf import PdfReader
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import anyio
 from app.core.env import settings
 
@@ -41,15 +42,15 @@ def extract_text_from_pdf_digital(file_bytes: bytes) -> str:
         raise e
 
 async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
-    """Call Gemini to extract text from scanned PDFs or images."""
+    """Call Gemini to extract text from scanned PDFs or images using the google-genai SDK."""
     try:
         import os
         api_key = settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not configured in settings or environment variables.")
         
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        # Initialize Google GenAI client
+        client = genai.Client(api_key=api_key)
         
         prompt = (
             "You are a document transcription system. Extract and transcribe all the textual content "
@@ -57,11 +58,17 @@ async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
             "Do not summarize or add commentary. Output only the extracted text."
         )
         
+        # Wrap bytes in the SDK Part model
+        binary_part = types.Part.from_bytes(
+            data=file_bytes,
+            mime_type=mime_type
+        )
+        
         def _generate():
-            response = model.generate_content([
-                {"mime_type": mime_type, "data": file_bytes},
-                prompt
-            ])
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[binary_part, prompt]
+            )
             return response.text
             
         return await anyio.to_thread.run_sync(_generate)
@@ -92,14 +99,14 @@ async def extract_text(file_bytes: bytes, content_type: str) -> str:
             logger.info("Successfully extracted text digitally from PDF")
             return digital_text
         else:
-            logger.info("Digital PDF extraction returned minimal text. Falling back to Gemini Vision OCR")
+            logger.info("Digital PDF extraction returned minimal text. Falling back to Gemini OCR")
             return await extract_text_via_gemini(file_bytes, "application/pdf")
             
     # Images
     elif "image" in c_type or c_type in ["png", "jpg", "jpeg", "webp"]:
         logger.info(f"Extracting text from image ({content_type}) via Gemini Vision")
         # Treat image types properly or fallback to general image/png
-        mime_type = content_type if "image" in c_type else f"image/{content_type.replace('jpg', 'jpeg')}"
+        mime_type = content_type if "image" in c_type else f"image/{c_type.replace('jpg', 'jpeg')}"
         return await extract_text_via_gemini(file_bytes, mime_type)
         
     # Text fallback
