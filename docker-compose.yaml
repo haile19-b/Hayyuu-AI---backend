@@ -12,5 +12,12 @@ services:
       - pgdata:/var/lib/postgresql/data
     restart: always
 
+  redis:
+    image: redis:7-alpine
+    container_name: hayyuu_redis
+    ports:
+      - "6379:6379"
+    restart: always
+
 volumes:
   pgdata:

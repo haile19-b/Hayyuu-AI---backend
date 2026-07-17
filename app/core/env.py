@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     STORAGE_SECRET_ACCESS_KEY: str
     STORAGE_BUCKET_NAME: str
     
+    REDIS_URL: str = "redis://localhost:6379/0"
+    GEMINI_API_KEY: str | None = None
+    
     APP_NAME: str = "FastAPI Backend"
     PORT: int = 8000
     CORS_ORIGINS: list[str] = ["*"]

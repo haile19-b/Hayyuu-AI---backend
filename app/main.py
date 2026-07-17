@@ -1,19 +1,29 @@
 from contextlib import asynccontextmanager
+import sys
+import asyncio
+
+# Fix psycopg Windows compatibility issues with ProactorEventLoop
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from app.core.env import settings
 from app.core.database import connect_db, disconnect_db
+from app.core.queue import connect_redis, disconnect_redis
 from app.interfaces.api.v1.routes import route as api_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Startup: Connect to DB
+    # 1. Startup: Connect to DB and Redis
     await connect_db()
+    await connect_redis()
     yield
-    # 2. Shutdown: Disconnect from DB
+    # 2. Shutdown: Disconnect from DB and Redis
     await disconnect_db()
+    await disconnect_redis()
 
 app = FastAPI(
     title="My API",
