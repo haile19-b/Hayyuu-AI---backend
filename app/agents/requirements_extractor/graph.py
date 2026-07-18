@@ -2,6 +2,9 @@ import logging
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from app.core.env import settings
+from app.core.database import prisma
+from app.core.progress import publish_progress
+from prisma.enums import DocumentStatus
 
 from app.agents.requirements_extractor.state import DocumentAnalysisState
 from app.agents.requirements_extractor.nodes import (
@@ -60,3 +63,18 @@ async def run_workflow(document_id: str, project_id: str) -> None:
                 "extracted_text": ""
             }
             await graph.ainvoke(initial_state, config=config)
+            
+        # Update document status in the database to INDEXED upon successful completion
+        await prisma.document.update(
+            where={"id": document_id},
+            data={"status": DocumentStatus.INDEXED}
+        )
+        
+        # Publish final progress completion status
+        await publish_progress(
+            document_id=document_id,
+            message="Document analysis pipeline completed successfully!",
+            step="finished",
+            status="COMPLETED"
+        )
+
