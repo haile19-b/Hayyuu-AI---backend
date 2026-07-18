@@ -6,6 +6,7 @@ from google import genai
 from google.genai import types
 import anyio
 from app.core.env import settings
+from app.core.config import genAI
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -44,13 +45,6 @@ def extract_text_from_pdf_digital(file_bytes: bytes) -> str:
 async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
     """Call Gemini to extract text from scanned PDFs or images using the google-genai SDK."""
     try:
-        import os
-        api_key = settings.GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY is not configured in settings or environment variables.")
-        
-        # Initialize Google GenAI client
-        client = genai.Client(api_key=api_key)
         
         prompt = (
             "You are a document transcription system. Extract and transcribe all the textual content "
@@ -65,8 +59,8 @@ async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
         )
         
         def _generate():
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
+            response = genAI.models.generate_content(
+                model="gemini-3.5-flash",
                 contents=[binary_part, prompt]
             )
             return response.text

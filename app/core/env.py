@@ -4,7 +4,6 @@ class Settings(BaseSettings):
     DATABASE_URL: str
     JWT_SECRET: str
     JWT_EXPIRE_MINUTES: int
-    GEMINI_API_KEY:str
     
     STORAGE_ENDPOINT_URL: str
     STORAGE_ACCESS_KEY_ID: str
