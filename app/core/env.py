@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     
     REDIS_URL: str = "redis://localhost:6379/0"
     GEMINI_API_KEY: str | None = None
+    MAX_FORM_SIZE_MB: int = 50
     
     APP_NAME: str = "FastAPI Backend"
     PORT: int = 8000

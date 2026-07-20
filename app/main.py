@@ -42,6 +42,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.state.max_form_size = settings.MAX_FORM_SIZE_MB * 1024 * 1024  # Configure form limit from settings
+
 # Register all application routes
 app.include_router(api_router, prefix="/api/v1")
 
