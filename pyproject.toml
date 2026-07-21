@@ -13,6 +13,8 @@ dependencies = [
     "google-genai>=2.12.1",
     "langgraph>=1.2.9",
     "langgraph-checkpoint-postgres>=3.1.0",
+    "neo4j>=6.2.0",
+    "pgvector>=0.5.0",
     "prisma>=0.15.0",
     "psycopg[binary]>=3.3.4",
     "pwdlib[argon2]>=0.3.0",
@@ -33,3 +35,8 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "ruff>=0.15.20",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+
