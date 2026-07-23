@@ -26,7 +26,7 @@ def test_deterministic_id_normalization():
 
 @pytest.mark.asyncio
 async def test_langgraph_agent_execution():
-    """Test full LangGraph knowledge builder flow using mock Neo4j writer."""
+    """Test full LangGraph knowledge builder flow using mock Neo4j & PGVector drivers."""
     raw_text = (
         "Hayyuu AI SRS document context.\n\n"
         "Requirement R1: The system shall support OAuth2 user authentication.\n"
@@ -41,23 +41,37 @@ async def test_langgraph_agent_execution():
     )
 
     class MockGenerateResponse:
-        text = '{"users":[], "projects":[], "documents":[], "requirements":[{"id":"r1", "title":"Requirement R1", "description":"support OAuth2 authentication", "type":"FUNCTIONAL", "priority":"P2", "status":"DRAFT"}], "tasks":[{"id":"t1", "title":"Task T1", "description":"Implement OAuth2 login", "status":"TODO", "priority":"P2"}], "conflicts":[], "relationships":[{"source_id":"t1", "target_id":"r1", "type":"IMPLEMENTS"}]}'
+        text = (
+            '{"nodes":['
+            '{"id":"r1", "label":"Requirement", "name":"Requirement R1", "description":"support OAuth2 authentication", "properties":[]},'
+            '{"id":"t1", "label":"Task", "name":"Task T1", "description":"Implement OAuth2 login", "properties":[]}'
+            '],'
+            '"relationships":['
+            '{"source_id":"t1", "target_id":"r1", "type":"IMPLEMENTS", "properties":[]}'
+            ']}'
+        )
 
-    # Patch write_knowledge_graph_to_neo4j to run without actual DB instance
-    with patch("app.agents.knowledge_builder.graph.write_knowledge_graph_to_neo4j", new_callable=AsyncMock) as mock_write, \
+    # Patch database calls & gemini API calls to avoid network dependency in unit tests
+    with patch("app.infrastructure.graph_store.neo4j.neo4j_graph_store.execute_query", new_callable=AsyncMock) as mock_neo4j, \
+         patch("app.agents.knowledge_builder.nodes.pgvector_store.upsert_chunks", new_callable=AsyncMock) as mock_vector, \
+         patch("app.agents.knowledge_builder.nodes.gemini_embedder.embed_batch") as mock_embed, \
          patch("app.agents.knowledge_builder.nodes.genAI.models.generate_content") as mock_generate:
         
         mock_generate.return_value = MockGenerateResponse()
+        mock_embed.return_value = [[0.01] * 768, [0.02] * 768]
+        mock_vector.return_value = 2
+
         # Run graph
         final_state = await knowledge_builder_graph.ainvoke(state)
         
         # Verify extraction worked
         assert "extracted_graph" in final_state
         graph = final_state["extracted_graph"]
-        assert len(graph.requirements) >= 1
-        assert len(graph.tasks) >= 1
+        assert len(graph.nodes) >= 2
         assert len(graph.relationships) >= 1
 
-        # Verify mock Neo4j writer was invoked with correct arguments
-        mock_write.assert_called_once_with("test-proj-001", graph)
+        # Verify execution stats
+        assert final_state["total_vectors_stored"] == 2
+        assert final_state["total_nodes_stored"] > 0
+        assert final_state["status"] == "completed"
         assert len(final_state["errors"]) == 0

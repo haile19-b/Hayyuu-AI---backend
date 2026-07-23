@@ -1,6 +1,7 @@
 import sys
 import asyncio
 import pytest
+from unittest.mock import AsyncMock, patch
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -53,18 +54,29 @@ async def test_document_ingestion_pipeline():
     # Ensure vector store table exists
     await pgvector_store.init_vector_store()
 
-    # Perform ingestion
-    res = await use_case.ingest_document_text(
-        document_id=doc_id,
-        project_id=proj_id,
-        raw_text=sample_text,
-        extra_metadata={"filename": "srs.pdf"},
-        chunk_size_tokens=50,
-        chunk_overlap_tokens=10,
-    )
+    class MockGenerateResponse:
+        text = '{"nodes":[], "relationships":[]}'
 
-    assert res["status"] == "indexed"
-    assert res["total_chunks"] >= 1
+    with patch("app.agents.knowledge_builder.nodes.gemini_embedder.embed_batch") as mock_embed, \
+         patch("app.infrastructure.graph_store.neo4j.neo4j_graph_store.execute_query", new_callable=AsyncMock) as mock_neo4j, \
+         patch("app.agents.knowledge_builder.nodes.genAI.models.generate_content") as mock_generate:
+        
+        mock_generate.return_value = MockGenerateResponse()
+        mock_embed.return_value = [[0.05] * 768]
+
+        # Perform ingestion
+        res = await use_case.ingest_document_text(
+            document_id=doc_id,
+            project_id=proj_id,
+            raw_text=sample_text,
+            extra_metadata={"filename": "srs.pdf"},
+            chunk_size_tokens=50,
+            chunk_overlap_tokens=10,
+        )
+
+        assert res["status"] == "indexed"
+        assert res["total_chunks"] >= 1
+        assert mock_neo4j.called
 
     # Search knowledge
     search_results = await use_case.search_document_knowledge(

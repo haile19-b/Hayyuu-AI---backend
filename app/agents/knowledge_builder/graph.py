@@ -1,32 +1,36 @@
 from langgraph.graph import StateGraph, END
 
 from app.agents.knowledge_builder.state import KnowledgeBuilderState
-from app.agents.knowledge_builder.nodes import extract_knowledge_graph_node
-from app.agents.knowledge_builder.tools import write_knowledge_graph_to_neo4j
-
-
-async def save_graph_to_database_node(state: KnowledgeBuilderState):
-    """Save extracted graph elements to Neo4j database."""
-    if state.errors:
-        return {}
-    try:
-        await write_knowledge_graph_to_neo4j(state.project_id, state.extracted_graph)
-    except Exception as e:
-        return {"errors": state.errors + [f"Neo4j write error: {e}"]}
-    return {}
-
+from app.agents.knowledge_builder.nodes import (
+    preprocess_chunk_node,
+    generate_embeddings_node,
+    extract_graph_node,
+    store_vectors_node,
+    store_graph_node,
+    save_results_node,
+)
 
 # Define workflow
 workflow = StateGraph(KnowledgeBuilderState)
 
-# Add nodes
-workflow.add_node("extract", extract_knowledge_graph_node)
-workflow.add_node("save", save_graph_to_database_node)
+# Add all agent workflow nodes
+workflow.add_node("preprocess", preprocess_chunk_node)
+workflow.add_node("embed", generate_embeddings_node)
+workflow.add_node("extract", extract_graph_node)
+workflow.add_node("store_vectors", store_vectors_node)
+workflow.add_node("store_graph", store_graph_node)
+workflow.add_node("save_results", save_results_node)
 
-# Set execution flow
-workflow.set_entry_point("extract")
-workflow.add_edge("extract", "save")
-workflow.add_edge("save", END)
+# Set entry point
+workflow.set_entry_point("preprocess")
 
-# Compile LangGraph
+# Connect nodes sequentially
+workflow.add_edge("preprocess", "embed")
+workflow.add_edge("embed", "extract")
+workflow.add_edge("extract", "store_vectors")
+workflow.add_edge("store_vectors", "store_graph")
+workflow.add_edge("store_graph", "save_results")
+workflow.add_edge("save_results", END)
+
+# Compile the agent graph
 knowledge_builder_graph = workflow.compile()

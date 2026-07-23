@@ -1,7 +1,6 @@
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.libs.chunker import chunk_document_text
 from app.infrastructure.ai.gemini_embedder import gemini_embedder
 from app.infrastructure.vector_store.pgvector import pgvector_store
 
@@ -9,7 +8,7 @@ logger = logging.getLogger("uvicorn.error")
 
 
 class DocumentIngestionUseCase:
-    """Use case service for document chunking, embedding, and PGVector ingestion."""
+    """Use case service for orchestrating document ingestion via the unified LangGraph Agent."""
 
     def __init__(self):
         self.embedder = gemini_embedder
@@ -25,52 +24,37 @@ class DocumentIngestionUseCase:
         chunk_overlap_tokens: int = 100,
     ) -> Dict[str, Any]:
         """
-        Chunks document text, generates Gemini embeddings, and persists chunks in PGVector.
+        Ingests document text by running the unified LangGraph knowledge builder agent.
         """
-        if not raw_text.strip():
-            logger.warning(f"Empty text received for document_id={document_id}")
+        from app.agents.knowledge_builder.graph import knowledge_builder_graph
+        from app.agents.knowledge_builder.state import KnowledgeBuilderState
+
+        filename = (extra_metadata or {}).get("filename", "document")
+
+        logger.info(f"Delegating document text ingestion to unified LangGraph Agent for document {document_id}")
+        state = KnowledgeBuilderState(
+            project_id=project_id,
+            document_id=document_id,
+            raw_text=raw_text,
+            filename=filename,
+        )
+
+        result_state = await knowledge_builder_graph.ainvoke(state)
+
+        if result_state.get("errors"):
+            logger.error(f"Unified Agent execution encountered errors: {result_state['errors']}")
             return {
                 "document_id": document_id,
                 "project_id": project_id,
                 "total_chunks": 0,
-                "status": "empty",
+                "status": "failed",
+                "errors": result_state["errors"],
             }
-
-        # 1. Chunk document text
-        chunk_dicts = chunk_document_text(
-            raw_text,
-            chunk_size_tokens=chunk_size_tokens,
-            chunk_overlap_tokens=chunk_overlap_tokens,
-        )
-        logger.info(f"Generated {len(chunk_dicts)} chunks for document {document_id}")
-
-        # 2. Extract contents and generate embeddings with Gemini
-        chunk_texts = [chunk["content"] for chunk in chunk_dicts]
-        embeddings = self.embedder.embed_batch(chunk_texts)
-
-        # 3. Attach embeddings and metadata
-        for idx, chunk in enumerate(chunk_dicts):
-            chunk["embedding"] = embeddings[idx]
-            meta = {
-                "token_count": chunk["token_count"],
-                "start_char": chunk["start_char"],
-                "end_char": chunk["end_char"],
-            }
-            if extra_metadata:
-                meta.update(extra_metadata)
-            chunk["metadata"] = meta
-
-        # 4. Upsert into PGVector
-        upserted_count = await self.vector_store.upsert_chunks(
-            document_id=document_id,
-            project_id=project_id,
-            chunks=chunk_dicts,
-        )
 
         return {
             "document_id": document_id,
             "project_id": project_id,
-            "total_chunks": upserted_count,
+            "total_chunks": result_state.get("total_vectors_stored", 0),
             "status": "indexed",
         }
 

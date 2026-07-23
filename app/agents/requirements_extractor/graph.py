@@ -55,6 +55,8 @@ async def run_workflow(document_id: str, project_id: str) -> None:
         if state and state.next:
             logger.info(f"Resuming document analysis workflow for {document_id} from node: {state.next}")
             await graph.ainvoke(None, config=config)
+        elif state and not state.next and state.values:
+            logger.info(f"Document analysis workflow already completed for {document_id}. Skipping requirements extraction.")
         else:
             logger.info(f"Starting new document analysis workflow execution for {document_id}")
             initial_state = {
@@ -63,6 +65,31 @@ async def run_workflow(document_id: str, project_id: str) -> None:
                 "extracted_text": ""
             }
             await graph.ainvoke(initial_state, config=config)
+            
+        # 1. Fetch document name for filename reference
+        document = await prisma.document.find_unique(where={"id": document_id})
+        filename = document.name if document else "document"
+
+        # 2. Extract the Gemini file URI if available from the requirements extractor checkpoint
+        state_after = await graph.aget_state(config)
+        gemini_file_uri = state_after.values.get("gemini_file_uri") if state_after else None
+        gemini_file_mime_type = state_after.values.get("gemini_file_mime_type") if state_after else None
+
+        # 3. Trigger Agent Knowledge Builder dynamically to build PGVector and Neo4j indices
+        from app.agents.knowledge_builder.graph import knowledge_builder_graph
+        from app.agents.knowledge_builder.state import KnowledgeBuilderState
+        
+        logger.info(f"Triggering Agent Knowledge Builder for document {document_id}")
+        await publish_progress(document_id, "Building knowledge graph and vector indices...", "knowledge_builder")
+        
+        kb_state = KnowledgeBuilderState(
+            project_id=project_id,
+            document_id=document_id,
+            filename=filename,
+            gemini_file_uri=gemini_file_uri,
+            gemini_file_mime_type=gemini_file_mime_type,
+        )
+        await knowledge_builder_graph.ainvoke(kb_state)
             
         # Update document status in the database to INDEXED upon successful completion
         await prisma.document.update(
