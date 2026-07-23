@@ -18,6 +18,7 @@ class DocumentsController:
             file_name = file.filename
             file_content = await file.read()
             content_type = file.content_type
+            
 
             result = await DocumentsService.upload_document(
                 project_id=project_id,
@@ -33,6 +34,7 @@ class DocumentsController:
                 elif err == "Unauthorized":
                     response.status_code = status.HTTP_403_FORBIDDEN
                 else:
+                    print(result)
                     response.status_code = status.HTTP_400_BAD_REQUEST
             else:
                 response.status_code = status.HTTP_201_CREATED

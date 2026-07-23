@@ -3,6 +3,7 @@ from app.core.database import prisma
 from app.core.storage import storage_utility
 from app.domain.entities.projects.projects_service import ProjectsService
 from prisma.enums import DocumentStatus
+from app.core.queue import enqueue_document_analysis
 
 class DocumentsService:
     @staticmethod
@@ -36,6 +37,9 @@ class DocumentsService:
                     "status": DocumentStatus.PENDING,
                 }
             )
+
+            # 4. Trigger background analysis job
+            await enqueue_document_analysis(document.id, project_id)
 
             return {
                 "success": True,

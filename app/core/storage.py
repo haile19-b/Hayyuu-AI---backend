@@ -38,9 +38,21 @@ class StorageUtility:
             ExpiresIn=expiration,
         )
 
+    def _download_file_sync(self, file_path: str) -> bytes:
+        response = self.s3_client.get_object(
+            Bucket=self.bucket_name,
+            Key=file_path,
+        )
+        return response["Body"].read()
+
     async def upload_file(self, file_content: bytes, file_path: str, content_type: str) -> None:
         await anyio.to_thread.run_sync(
             self._upload_file_sync, file_content, file_path, content_type
+        )
+
+    async def download_file(self, file_path: str) -> bytes:
+        return await anyio.to_thread.run_sync(
+            self._download_file_sync, file_path
         )
 
     async def delete_file(self, file_path: str) -> None:
