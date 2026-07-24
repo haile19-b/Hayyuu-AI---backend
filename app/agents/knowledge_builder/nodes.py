@@ -70,6 +70,7 @@ async def preprocess_chunk_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                 token_count=c["token_count"],
                 start_char=c["start_char"],
                 end_char=c["end_char"],
+                metadata=c.get("metadata"),
             )
             for c in chunks
         ]
@@ -137,7 +138,7 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         if state.gemini_file_uri and state.gemini_file_mime_type:
             logger.info(f"[Node: extract_graph] Running extraction using Gemini File URI: {state.gemini_file_uri}")
             response = genAI.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.6-flash",
                 contents=[
                     types.Part.from_uri(file_uri=state.gemini_file_uri, mime_type=state.gemini_file_mime_type),
                     prompt
@@ -151,7 +152,7 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         else:
             logger.info("[Node: extract_graph] Running extraction using raw text input...")
             response = genAI.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.6-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -265,17 +266,21 @@ async def store_vectors_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     
     chunk_dicts = []
     for c in state.chunks:
+        meta = {
+            "token_count": c.token_count,
+            "start_char": c.start_char,
+            "end_char": c.end_char,
+            "filename": state.filename,
+        }
+        if c.metadata:
+            meta.update(c.metadata)
+            
         chunk_dicts.append(
             {
                 "chunk_index": c.chunk_index,
                 "content": c.content,
                 "embedding": c.embedding,
-                "metadata": {
-                    "token_count": c.token_count,
-                    "start_char": c.start_char,
-                    "end_char": c.end_char,
-                    "filename": state.filename,
-                },
+                "metadata": meta,
             }
         )
 

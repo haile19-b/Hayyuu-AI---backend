@@ -80,3 +80,4 @@ class WorkerSettings:
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
     on_startup = startup
     on_shutdown = shutdown
+    job_timeout = 1800  # Give 30 minutes for large document parses and first-time downloads
