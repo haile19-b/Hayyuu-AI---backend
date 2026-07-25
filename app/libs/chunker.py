@@ -142,6 +142,53 @@ class RecursiveTextSplitter:
         return structured_chunks
 
 
+def merge_short_structured_chunks(chunks: List[Dict[str, Any]], min_chars: int = 200) -> List[Dict[str, Any]]:
+    """
+    Consolidates undersized adjacent structured chunks (e.g. headers, footers, page numbers)
+    by merging them forward into the next chunk. Resets indices and merges metadata.
+    """
+    merged: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    for c in chunks:
+        content = c["content"].strip()
+        if not content:
+            continue
+
+        if current is None:
+            current = c
+        else:
+            current_content = current["content"].strip()
+            # If current chunk is below threshold, merge it forward into the incoming chunk c
+            if len(current_content) < min_chars:
+                c["content"] = current_content + "\n\n" + content
+                c["start_char"] = current["start_char"]
+                
+                # Merge section paths if present
+                curr_path = current.get("metadata", {}).get("section_path", "")
+                c_path = c.get("metadata", {}).get("section_path", "")
+                if curr_path and curr_path not in c_path:
+                    c["metadata"]["section_path"] = curr_path + " > " + c_path if c_path else curr_path
+                
+                # Carry forward table flags
+                if current.get("metadata", {}).get("is_table"):
+                    c["metadata"]["is_table"] = True
+
+                current = c
+            else:
+                merged.append(current)
+                current = c
+
+    if current is not None:
+        merged.append(current)
+
+    # Re-index chunks sequentially
+    for idx, c in enumerate(merged):
+        c["chunk_index"] = idx
+
+    return merged
+
+
 def chunk_document_text(
     text: str,
     chunk_size_tokens: int = 500,
@@ -150,7 +197,7 @@ def chunk_document_text(
     """
     Ingests raw document text, converts it to a Docling document in-memory,
     and runs a layout-aware HybridChunker to preserve sections, headers, and tables.
-    Falls back to RecursiveTextSplitter on error or if Docling is unconfigured.
+    Consolidates short fragments and falls back to RecursiveTextSplitter on error.
     """
     # 1. Attempt layout-aware chunking via IBM Docling
     if doc_chunker_converter:
@@ -202,8 +249,9 @@ def chunk_document_text(
                 start_offset += max(1, chunk_len - overlap_chars)
                 
             if structured_chunks:
-                logger.info(f"Layout-aware Docling chunker generated {len(structured_chunks)} chunks.")
-                return structured_chunks
+                consolidated = merge_short_structured_chunks(structured_chunks, min_chars=200)
+                logger.info(f"Layout-aware Docling chunker generated {len(consolidated)} chunks (consolidated from {len(structured_chunks)}).")
+                return consolidated
         except Exception as e:
             logger.warning(f"Docling chunker failed: {e}. Falling back to RecursiveTextSplitter.")
 
