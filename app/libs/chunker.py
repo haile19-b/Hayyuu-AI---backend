@@ -142,10 +142,10 @@ class RecursiveTextSplitter:
         return structured_chunks
 
 
-def merge_short_structured_chunks(chunks: List[Dict[str, Any]], min_chars: int = 200) -> List[Dict[str, Any]]:
+def merge_short_structured_chunks(chunks: List[Dict[str, Any]], min_words: int = 75) -> List[Dict[str, Any]]:
     """
     Consolidates undersized adjacent structured chunks (e.g. headers, footers, page numbers)
-    by merging them forward into the next chunk. Resets indices and merges metadata.
+    by merging them forward into the next chunk based on word count. Resets indices and merges metadata.
     """
     merged: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
@@ -159,8 +159,10 @@ def merge_short_structured_chunks(chunks: List[Dict[str, Any]], min_chars: int =
             current = c
         else:
             current_content = current["content"].strip()
-            # If current chunk is below threshold, merge it forward into the incoming chunk c
-            if len(current_content) < min_chars:
+            # Count actual words
+            word_count = len(re.findall(r"\w+", current_content))
+            # If current chunk has fewer than min_words, merge it forward into the incoming chunk c
+            if word_count < min_words:
                 c["content"] = current_content + "\n\n" + content
                 c["start_char"] = current["start_char"]
                 
@@ -249,7 +251,7 @@ def chunk_document_text(
                 start_offset += max(1, chunk_len - overlap_chars)
                 
             if structured_chunks:
-                consolidated = merge_short_structured_chunks(structured_chunks, min_chars=200)
+                consolidated = merge_short_structured_chunks(structured_chunks, min_words=50)
                 logger.info(f"Layout-aware Docling chunker generated {len(consolidated)} chunks (consolidated from {len(structured_chunks)}).")
                 return consolidated
         except Exception as e:
