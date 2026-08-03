@@ -89,7 +89,7 @@ async def query_analysis_node(state: SearchAgentState) -> Dict[str, Any]:
 
     try:
         # Perform PGVector search
-        query_vector = gemini_embedder.embed_text(query_text)
+        query_vector = gemini_embedder.embed_text(query_text,user_query = True)
         chunks = await pgvector_store.search_similar(
             query_vector=query_vector,
             project_id=project_id,
@@ -276,29 +276,45 @@ async def agent_loop_node(state: SearchAgentState) -> Dict[str, Any]:
             
         prompt = f"""
 You are Hayyuu AI, a senior systems engineer and product analyst assistant.
-Your task is to synthesize a comprehensive, trace-validated answer to the user's question about a project.
 
-Below is the context retrieved from vector search and graph relations:
+Your task is to provide a comprehensive, factual, and traceable answer to the user's question about the project using the available context.
+
+Below is the retrieved context:
 
 1. Document Text Chunks (Semantic Vector Search):
 ---
 {chunks_context}
 ---
 
-2. Graph Relationship Context (Neo4j subgraphs showing dependencies, requirements, tasks, and conflicts):
+2. Graph Relationship Context (Neo4j subgraphs showing dependencies, requirements, tasks, conflicts, and related entities):
 ---
 {graph_context}
 ---
 
-Your Active Project ID is: {project_id}
-User's Question: {query_text}
+Active Project ID: {project_id}
+
+User's Question:
+{query_text}
 
 Instructions:
-1. Synthesize a comprehensive, clear, and factual answer using both the document text chunks and the graph relationships.
-2. If you need specific structured database information (like checking document lists, requirements lists, task lists, active conflicts, or AI suggestions), you MUST invoke the appropriate database tools provided to you.
-3. If there are active conflicts (e.g. RequirementConflict, or CONFLICTS_WITH relationships), explain them clearly along with any recommended solutions.
-4. Be specific and trace-validate your answer by referencing entity names and IDs (e.g. [Req ID: req-xxx] or [Task ID: task-xxx]) where appropriate.
-5. If the provided context is insufficient to answer the question, state that clearly. Do not make up any facts or relationships.
+
+1. If the user's message is only a greeting or casual conversation (e.g., "Hi", "Hello", "Good morning", "How are you?", "Thanks"), respond naturally without invoking any database tools or performing project-related analysis.
+
+2. For project-related questions, synthesize a clear, comprehensive, and factual answer using both the document text chunks and the graph relationship context whenever relevant.
+
+3. Only if the user's query requires specific structured database information (such as document lists, requirement lists, task lists, active conflicts, AI suggestions, or other structured project records), you MUST invoke the appropriate database tools provided to you.
+
+4. If active conflicts exist (for example, RequirementConflict nodes or CONFLICTS_WITH relationships), explain:
+   - what the conflict is,
+   - which entities are involved,
+   - the potential impact, and
+   - any recommended resolutions if available.
+
+5. Make your answer traceable by referencing relevant entity identifiers whenever possible (for example, [REQ-001], [TASK-015], or other entity names present in the context).
+
+6. If the retrieved context is insufficient to answer the user's question, explicitly state that the available information is insufficient. Do not invent facts, relationships, or project data.
+
+7. Prioritize accuracy over completeness. Never fabricate project information or database records.
 
 Synthesized Answer:
 """

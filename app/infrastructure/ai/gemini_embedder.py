@@ -16,18 +16,21 @@ class GeminiEmbedder:
         self.client = genAI
         self.model = "gemini-embedding-2"
 
-    def embed_text(self, text: str) -> List[float]:
-        """Generate vector embedding (768-dim) for a single query text string."""
+    def embed_text(self, text: str, user_query: bool = True) -> List[float]:
+        """Generate vector embedding (768-dim) for a single query or document text string."""
         if not text.strip():
-            return [0.0] * 768
+            raise ValueError("Cannot embed empty text")
 
-        # Task prefix for search query
-        prefixed_text = f"task: search query | {text}"
+        task_type = "RETRIEVAL_QUERY" if user_query else "RETRIEVAL_DOCUMENT"
+
         try:
             response = self.client.models.embed_content(
                 model=self.model,
-                contents=prefixed_text,
-                config=types.EmbedContentConfig(output_dimensionality=768),
+                contents=text,
+                config=types.EmbedContentConfig(
+                    task_type=task_type,
+                    output_dimensionality=768,
+                ),
             )
             # Access embeddings as returned result list
             if hasattr(response, "embeddings") and response.embeddings:
