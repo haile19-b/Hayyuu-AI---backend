@@ -1,16 +1,17 @@
 import sys
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-from app.domain.entities.search.search_service import SearchService
+from app.agents.search_agent.graph import search_agent_graph
+from app.agents.search_agent.state import SearchAgentState
 from app.infrastructure.vector_store.pgvector import pgvector_store
 
 @pytest.mark.asyncio
-async def test_search_service_retrieval_and_synthesis_with_tool_calling():
+async def test_search_agent_workflow():
     project_id = "test-proj-rag-123"
     doc_id = "test-doc-rag-123"
     query = "How many documents are in the auth module project?"
@@ -30,11 +31,12 @@ async def test_search_service_retrieval_and_synthesis_with_tool_calling():
     ]
     await pgvector_store.upsert_chunks(doc_id, project_id, chunks)
 
-    # Mock the external services
-    with patch("app.domain.entities.search.search_service.gemini_embedder.embed_text") as mock_embed, \
-         patch("app.domain.entities.search.search_service.neo4j_graph_store.execute_query", new_callable=AsyncMock) as mock_neo4j, \
-         patch("app.domain.entities.search.search_service.genAI.models.generate_content") as mock_gen_content, \
-         patch("app.domain.entities.search.search_service.prisma") as mock_prisma:
+    # Mock the external services at their definition sources
+    with patch("app.infrastructure.ai.gemini_embedder.gemini_embedder.embed_text") as mock_embed, \
+         patch("app.infrastructure.graph_store.neo4j.neo4j_graph_store.execute_query", new_callable=AsyncMock) as mock_neo4j, \
+         patch("app.agents.search_agent.nodes.genAI.models.generate_content") as mock_gen_content, \
+         patch("app.agents.search_agent.nodes.prisma") as mock_prisma_nodes, \
+         patch("app.agents.search_agent.tools.prisma") as mock_prisma_tools:
 
         mock_embed.return_value = dummy_vector
 
@@ -52,21 +54,21 @@ async def test_search_service_retrieval_and_synthesis_with_tool_calling():
                 self.sizeBytes = sizeBytes
                 self.status = status
 
-        mock_prisma.requirement.find_many = AsyncMock(return_value=[
+        mock_prisma_nodes.requirement.find_many = AsyncMock(return_value=[
             MockRequirement("da8636e0-2475-4d2d-9653-53d7e82b7db5", "Auth Module")
         ])
-        mock_prisma.task.find_many = AsyncMock(return_value=[])
-        mock_prisma.document.find_many = AsyncMock(return_value=[
+        mock_prisma_nodes.task.find_many = AsyncMock(return_value=[])
+        mock_prisma_tools.document.find_many = AsyncMock(return_value=[
             MockDocument("doc-999", "specification.pdf", "pdf", 1024, "INDEXED")
         ])
 
         # Mock Neo4j records
         mock_neo4j.side_effect = [
-            # 1. Project nodes list query (for name matching)
+            # 1. Project nodes list query (for name matching inside retrieve_hybrid_context)
             [
                 {"id": "da8636e0-2475-4d2d-9653-53d7e82b7db5", "name": "Auth Module", "labels": ["Requirement"]}
             ],
-            # 2. relationships query
+            # 2. Neo4j relationships query
             [
                 {
                     "n": {"id": "da8636e0-2475-4d2d-9653-53d7e82b7db5", "name": "Auth Module", "description": "Validate users"},
@@ -76,7 +78,7 @@ async def test_search_service_retrieval_and_synthesis_with_tool_calling():
                     "m_labels": ["Task"]
                 }
             ],
-            # 3. isolated nodes query
+            # 3. Neo4j nodes query
             [
                 {
                     "n": {"id": "da8636e0-2475-4d2d-9653-53d7e82b7db5", "name": "Auth Module", "description": "Validate users"},
@@ -91,14 +93,25 @@ async def test_search_service_retrieval_and_synthesis_with_tool_calling():
                 self.name = name
                 self.args = args
 
+        class MockPart:
+            def __init__(self, function_call=None, text=""):
+                self.function_call = function_call
+                self.text = text
+
+        class MockContent:
+            def __init__(self, parts, role="model"):
+                self.parts = parts
+                self.role = role
+
         class MockCandidate:
             def __init__(self, content):
                 self.content = content
 
         class MockResponseWithTool:
             def __init__(self):
-                self.function_calls = [MockFunctionCall("query_project_documents", {"project_id": project_id})]
-                self.candidates = [MockCandidate("Mock calling database tool...")]
+                func_call = MockFunctionCall("relational_db_tool", {"project_id": project_id, "action": "list_documents"})
+                self.function_calls = [func_call]
+                self.candidates = [MockCandidate(MockContent([MockPart(function_call=func_call)]))]
                 self.text = ""
 
         class MockFinalResponse:
@@ -113,27 +126,30 @@ async def test_search_service_retrieval_and_synthesis_with_tool_calling():
             MockFinalResponse()
         ]
 
-        # Execute generate_rag_answer
-        response = await SearchService.generate_rag_answer(
+        # Initialize the LangGraph Search Agent State
+        state = SearchAgentState(
             project_id=project_id,
             query_text=query,
             document_id=doc_id,
             limit=1
         )
 
+        # Invoke the LangGraph Search Agent Graph
+        result_state = await search_agent_graph.ainvoke(state)
+
         # Assertions
-        assert response.answer == "Synthesized answer: The project has 1 document: specification.pdf."
-        assert len(response.sources) >= 1
-        assert response.sources[0].content == "The auth module project contains multiple requirements and design files."
+        assert result_state.get("answer") == "Synthesized answer: The project has 1 document: specification.pdf."
+        assert len(result_state.get("chunks", [])) >= 1
+        assert result_state.get("chunks")[0].content == "The auth module project contains multiple requirements and design files."
         
         # Verify graph node mapping was performed
-        assert len(response.nodes) == 2
-        node_ids = {n.id for n in response.nodes}
+        assert len(result_state.get("graph_nodes", [])) == 2
+        node_ids = {n.id for n in result_state.get("graph_nodes", [])}
         assert "da8636e0-2475-4d2d-9653-53d7e82b7db5" in node_ids
         assert "da8636e0-2475-4d2d-9653-53d7e82b7db6" in node_ids
 
-        # Verify that mock_prisma.document.find_many was called during the tool execution loop
-        mock_prisma.document.find_many.assert_called_once_with(where={"projectId": project_id})
+        # Verify that mock_prisma_tools.document.find_many was called during the tool execution loop
+        mock_prisma_tools.document.find_many.assert_called_once_with(where={"projectId": project_id})
 
         # Cleanup pgvector chunks
         await pgvector_store.delete_document_chunks(doc_id)
