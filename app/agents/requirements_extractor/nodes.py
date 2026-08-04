@@ -3,7 +3,6 @@ import json
 import os
 import anyio
 from io import BytesIO
-from pydantic import BaseModel, Field
 from google import genai
 
 from app.agents.requirements_extractor.schema import ExtractionResponse, SuggestionsResponse
@@ -299,7 +298,7 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
             data={
                 "projectId": proj_id,
                 "type": "gap_analysis",
-                "content": Json({
+                "content": json({
                     "title": sug["title"],
                     "description": sug["description"],
                     "reasoning": sug["reasoning"],
