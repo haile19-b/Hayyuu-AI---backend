@@ -66,7 +66,7 @@ async def run_workflow(document_id: str, project_id: str) -> None:
         gemini_file_mime_type = state_after.values.get("gemini_file_mime_type") if state_after else None
 
         # 3. Trigger Agent Knowledge Builder dynamically to build PGVector and Neo4j indices
-        from app.agents.knowledge_builder.graph import knowledge_builder_graph
+        from app.agents.knowledge_builder.graph import run_knowledge_builder
         from app.agents.knowledge_builder.state import KnowledgeBuilderState
         
         logger.info(f"Triggering Agent Knowledge Builder for document {document_id}")
@@ -79,7 +79,7 @@ async def run_workflow(document_id: str, project_id: str) -> None:
             gemini_file_uri=gemini_file_uri,
             gemini_file_mime_type=gemini_file_mime_type,
         )
-        await knowledge_builder_graph.ainvoke(kb_state)
+        await run_knowledge_builder(kb_state)
             
         # Update document status in the database to INDEXED upon successful completion
         await prisma.document.update(
