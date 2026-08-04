@@ -80,34 +80,79 @@ def format_neo4j_records(rel_records: List[dict], node_records: List[dict]) -> s
 
 # 1. Query Analysis Node
 async def query_analysis_node(state: SearchAgentState) -> Dict[str, Any]:
-    """Generates embeddings, queries PGVector, and extracts matched entity IDs/names."""
-    logger.info("[Node: query_analysis] Generating query embedding and performing vector similarity search...")
+    """Generates embeddings, queries Neo4j vector index with sequential window context, and extracts matched entity IDs/names."""
+    logger.info("[Node: query_analysis] Generating query embedding and performing Neo4j native vector search...")
     query_text = state.query_text
     project_id = state.project_id
     document_id = state.document_id
     limit = state.limit
 
+    import json
     try:
-        # Perform PGVector search
-        query_vector = gemini_embedder.embed_text(query_text,user_query = True)
-        chunks = await pgvector_store.search_similar(
-            query_vector=query_vector,
-            project_id=project_id,
-            top_k=limit,
-            document_id=document_id
+        # Perform query embedding
+        query_vector = gemini_embedder.embed_text(query_text, user_query=True)
+        
+        # Cypher query for native vector search + sequential window expansion
+        cypher = """
+        CALL db.index.vector.queryNodes('chunk_vector_index', $top_k, $query_vector) YIELD node, score
+        WHERE node.project_id = $project_id
+          AND ($document_id IS NULL OR node.document_id = $document_id)
+          AND score > 0.6
+        OPTIONAL MATCH (prev:Chunk)-[:NEXT]->(node)
+        OPTIONAL MATCH (node)-[:NEXT]->(next:Chunk)
+        RETURN node.id as id,
+               node.document_id as document_id,
+               node.project_id as project_id,
+               node.chunk_index as chunk_index,
+               node.content as content,
+               prev.content as prev_content,
+               next.content as next_content,
+               node.metadata as metadata,
+               score as similarity
+        ORDER BY similarity DESC
+        """
+        
+        records = await neo4j_graph_store.execute_query(
+            cypher,
+            {
+                "top_k": limit,
+                "query_vector": query_vector,
+                "project_id": project_id,
+                "document_id": document_id
+            }
         )
         
-        # Map PGVector chunks to VectorSource
+        # Map Neo4j chunk records to VectorSource schema
         sources = []
-        for c in chunks:
+        for r in records:
+            # Reconstruct the window text: prev_content + content + next_content
+            combined_content = ""
+            prev_txt = r.get("prev_content")
+            curr_txt = r.get("content") or ""
+            next_txt = r.get("next_content")
+            
+            if prev_txt:
+                combined_content += prev_txt.strip() + " \n "
+            combined_content += curr_txt.strip()
+            if next_txt:
+                combined_content += " \n " + next_txt.strip()
+                
+            raw_meta = r.get("metadata")
+            meta = {}
+            if raw_meta:
+                try:
+                    meta = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+                except Exception:
+                    meta = {"raw_meta": raw_meta}
+                    
             sources.append(
                 VectorSource(
-                    id=c.get("id"),
-                    documentId=c.get("document_id"),
-                    chunkIndex=c.get("chunk_index"),
-                    content=c.get("content"),
-                    similarity=c.get("similarity", 0.0),
-                    metadata=c.get("metadata")
+                    id=r.get("id") or "unknown-chunk",
+                    documentId=r.get("document_id") or "unknown-doc",
+                    chunkIndex=r.get("chunk_index") or 0,
+                    content=combined_content,
+                    similarity=float(r.get("similarity") or 0.0),
+                    metadata=meta
                 )
             )
             

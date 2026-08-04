@@ -51,18 +51,39 @@ async def test_document_ingestion_pipeline():
     use_case = DocumentIngestionUseCase()
     use_case.embedder = DummyEmbedder()
 
-    # Ensure vector store table exists
-    await pgvector_store.init_vector_store()
-
     class MockGenerateResponse:
         text = '{"nodes":[], "relationships":[]}'
 
     with patch("app.agents.knowledge_builder.nodes.gemini_embedder.embed_batch") as mock_embed, \
          patch("app.infrastructure.graph_store.neo4j.neo4j_graph_store.execute_query", new_callable=AsyncMock) as mock_neo4j, \
+         patch("app.infrastructure.graph_store.neo4j.neo4j_graph_store.execute_write_batch", new_callable=AsyncMock) as mock_neo4j_batch, \
          patch("app.agents.knowledge_builder.nodes.genAI.models.generate_content") as mock_generate:
         
         mock_generate.return_value = MockGenerateResponse()
         mock_embed.return_value = [[0.05] * 768]
+        mock_neo4j_batch.return_value = []
+
+        async def mock_neo4j_dispatch(query, parameters=None):
+            q_lower = query.lower()
+            if "querynodes" in q_lower:
+                return [
+                    {
+                        "id": "chunk-0",
+                        "document_id": doc_id,
+                        "project_id": proj_id,
+                        "chunk_index": 0,
+                        "content": "chunk text",
+                        "prev_content": None,
+                        "next_content": None,
+                        "metadata": '{"filename": "srs.pdf"}',
+                        "similarity": 0.95
+                    }
+                ]
+            elif "detach delete" in q_lower and "c:chunk" in q_lower:
+                return [{"cnt": 1}]
+            return []
+
+        mock_neo4j.side_effect = mock_neo4j_dispatch
 
         # Perform ingestion
         res = await use_case.ingest_document_text(
@@ -78,18 +99,18 @@ async def test_document_ingestion_pipeline():
         assert res["total_chunks"] >= 1
         assert mock_neo4j.called
 
-    # Search knowledge
-    search_results = await use_case.search_document_knowledge(
-        query_text="knowledge builder",
-        project_id=proj_id,
-        top_k=2,
-    )
-    assert len(search_results) >= 1
-    assert search_results[0]["document_id"] == doc_id
+        # Search knowledge
+        search_results = await use_case.search_document_knowledge(
+            query_text="knowledge builder",
+            project_id=proj_id,
+            top_k=2,
+        )
+        assert len(search_results) >= 1
+        assert search_results[0]["document_id"] == doc_id
 
-    # Remove knowledge
-    deleted = await use_case.remove_document_knowledge(doc_id)
-    assert deleted >= 1
+        # Remove knowledge
+        deleted = await use_case.remove_document_knowledge(doc_id)
+        assert deleted >= 1
 
 
 def test_live_gemini_embedding_api():

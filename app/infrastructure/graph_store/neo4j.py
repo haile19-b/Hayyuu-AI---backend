@@ -49,7 +49,7 @@ class Neo4jGraphStore:
             return False
 
     async def init_graph_store(self) -> None:
-        """Create initial unique constraints for nodes in Neo4j schema."""
+        """Create initial unique constraints and vector indexes in Neo4j schema."""
         driver = await self.connect()
         constraints = [
             "CREATE CONSTRAINT user_id_unique IF NOT EXISTS FOR (u:User) REQUIRE u.id IS UNIQUE;",
@@ -58,6 +58,7 @@ class Neo4jGraphStore:
             "CREATE CONSTRAINT requirement_id_unique IF NOT EXISTS FOR (r:Requirement) REQUIRE r.id IS UNIQUE;",
             "CREATE CONSTRAINT task_id_unique IF NOT EXISTS FOR (t:Task) REQUIRE t.id IS UNIQUE;",
             "CREATE CONSTRAINT conflict_id_unique IF NOT EXISTS FOR (c:Conflict) REQUIRE c.id IS UNIQUE;",
+            "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE;",
         ]
 
         async with driver.session() as session:
@@ -67,7 +68,23 @@ class Neo4jGraphStore:
                 except Exception as e:
                     logger.error(f"Error creating constraint query '{constraint_query}': {e}")
                     raise e
-        logger.info("✅ Neo4j unique constraints created successfully.")
+            
+            # Create native vector index for chunk embeddings
+            vector_index_query = """
+            CREATE VECTOR INDEX chunk_vector_index IF NOT EXISTS
+            FOR (c:Chunk) ON (c.embedding)
+            OPTIONS {indexConfig: {
+              `vector.dimensions`: 768,
+              `vector.similarity_function`: 'cosine'
+            }}
+            """
+            try:
+                await session.run(vector_index_query)
+            except Exception as e:
+                logger.error(f"Error creating vector index chunk_vector_index: {e}")
+                raise e
+                
+        logger.info("✅ Neo4j unique constraints and vector index initialized successfully.")
 
     async def execute_query(
         self,

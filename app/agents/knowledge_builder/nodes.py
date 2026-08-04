@@ -255,17 +255,21 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
 
 # 4. Store Vectors Node
 async def store_vectors_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
-    """Persists document chunks and vector embeddings into PGVector."""
+    """Persists document chunks and vector embeddings directly into Neo4j."""
     if state.errors:
         return {}
 
     doc_id = state.document_id or "synthesized-doc"
     proj_id = state.project_id
 
-    logger.info(f"[Node: store_vectors] Writing vector chunks for document {doc_id} to PGVector...")
+    logger.info(f"[Node: store_vectors] Storing vector chunks for document {doc_id} directly in Neo4j...")
     
-    chunk_dicts = []
+    import json
+    chunk_batch = []
     for c in state.chunks:
+        # Generate stable UUID for Chunk node
+        chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{proj_id}-{doc_id}-chunk-{c.chunk_index}"))
+        
         meta = {
             "token_count": c.token_count,
             "start_char": c.start_char,
@@ -275,25 +279,69 @@ async def store_vectors_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         if c.metadata:
             meta.update(c.metadata)
             
-        chunk_dicts.append(
+        chunk_batch.append(
             {
+                "id": chunk_uuid,
+                "document_id": doc_id,
+                "project_id": proj_id,
                 "chunk_index": c.chunk_index,
                 "content": c.content,
                 "embedding": c.embedding,
-                "metadata": meta,
+                "metadata": json.dumps(meta),
             }
         )
 
     try:
-        stored_count = await pgvector_store.upsert_chunks(
-            document_id=doc_id,
-            project_id=proj_id,
-            chunks=chunk_dicts,
-        )
-        return {"total_vectors_stored": stored_count}
+        # Idempotency: delete old chunks for this document in Neo4j
+        delete_query = """
+        MATCH (c:Chunk {document_id: $doc_id})
+        DETACH DELETE c
+        """
+        await neo4j_graph_store.execute_query(delete_query, {"doc_id": doc_id})
+
+        # Batch insert chunk nodes
+        insert_query = """
+        UNWIND $batch as row
+        MERGE (c:Chunk {id: row.id})
+        SET c.document_id = row.document_id,
+            c.project_id = row.project_id,
+            c.chunk_index = row.chunk_index,
+            c.content = row.content,
+            c.embedding = row.embedding,
+            c.metadata = row.metadata,
+            c.created_at = timestamp()
+        """
+        await neo4j_graph_store.execute_write_batch(insert_query, chunk_batch)
+
+        # Connect chunks to Project
+        project_link = """
+        MATCH (p:Project {id: $proj_id})
+        MATCH (c:Chunk {project_id: $proj_id, document_id: $doc_id})
+        MERGE (p)-[:HAS_CHUNK]->(c)
+        """
+        await neo4j_graph_store.execute_query(project_link, {"proj_id": proj_id, "doc_id": doc_id})
+
+        # Connect chunks to Document
+        doc_link = """
+        MATCH (d:Document {id: $doc_id})
+        MATCH (c:Chunk {document_id: $doc_id})
+        MERGE (c)-[:PART_OF]->(d)
+        """
+        await neo4j_graph_store.execute_query(doc_link, {"doc_id": doc_id})
+
+        # Link chunks sequentially without APOC dependency
+        sequence_link = """
+        MATCH (c1:Chunk {document_id: $doc_id})
+        MATCH (c2:Chunk {document_id: $doc_id})
+        WHERE c2.chunk_index = c1.chunk_index + 1
+        MERGE (c1)-[:NEXT]->(c2)
+        """
+        await neo4j_graph_store.execute_query(sequence_link, {"doc_id": doc_id})
+
+        return {"total_vectors_stored": len(chunk_batch)}
     except Exception as e:
-        logger.error(f"Failed storing vectors: {e}")
-        return {"errors": state.errors + [f"PGVector write error: {e}"]}
+        logger.error(f"Failed storing chunk vectors in Neo4j: {e}")
+        return {"errors": state.errors + [f"Neo4j vector write error: {e}"]}
 
 
 # 5. Store Graph Node

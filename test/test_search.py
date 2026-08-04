@@ -8,7 +8,6 @@ if sys.platform == "win32":
 
 from app.agents.search_agent.graph import search_agent_graph
 from app.agents.search_agent.state import SearchAgentState
-from app.infrastructure.vector_store.pgvector import pgvector_store
 
 @pytest.mark.asyncio
 async def test_search_agent_workflow():
@@ -16,20 +15,7 @@ async def test_search_agent_workflow():
     doc_id = "test-doc-rag-123"
     query = "How many documents are in the auth module project?"
 
-    # Ensure PGVector store is ready
-    await pgvector_store.init_vector_store()
-
-    # Pre-populate PGVector with some chunks for this project
     dummy_vector = [0.01] * 768
-    chunks = [
-        {
-            "chunk_index": 0,
-            "content": "The auth module project contains multiple requirements and design files.",
-            "embedding": dummy_vector,
-            "metadata": {"filename": "auth.py"},
-        }
-    ]
-    await pgvector_store.upsert_chunks(doc_id, project_id, chunks)
 
     # Mock the external services at their definition sources
     with patch("app.infrastructure.ai.gemini_embedder.gemini_embedder.embed_text") as mock_embed, \
@@ -64,11 +50,25 @@ async def test_search_agent_workflow():
 
         # Mock Neo4j records
         mock_neo4j.side_effect = [
-            # 1. Project nodes list query (for name matching inside retrieve_hybrid_context)
+            # 1. Neo4j native vector search index query (in query_analysis_node)
+            [
+                {
+                    "id": "chunk-123",
+                    "document_id": doc_id,
+                    "project_id": project_id,
+                    "chunk_index": 0,
+                    "content": "The auth module project contains multiple requirements and design files.",
+                    "prev_content": None,
+                    "next_content": None,
+                    "metadata": '{"filename": "auth.py"}',
+                    "similarity": 0.95
+                }
+            ],
+            # 2. Project nodes list query (for name matching inside retrieve_hybrid_context/graph_retrieval_node)
             [
                 {"id": "da8636e0-2475-4d2d-9653-53d7e82b7db5", "name": "Auth Module", "labels": ["Requirement"]}
             ],
-            # 2. Neo4j relationships query
+            # 3. Neo4j relationships query (called inside graph_db_tool)
             [
                 {
                     "n": {"id": "da8636e0-2475-4d2d-9653-53d7e82b7db5", "name": "Auth Module", "description": "Validate users"},
@@ -78,7 +78,7 @@ async def test_search_agent_workflow():
                     "m_labels": ["Task"]
                 }
             ],
-            # 3. Neo4j nodes query
+            # 4. Neo4j nodes query (called inside graph_db_tool)
             [
                 {
                     "n": {"id": "da8636e0-2475-4d2d-9653-53d7e82b7db5", "name": "Auth Module", "description": "Validate users"},
@@ -150,6 +150,3 @@ async def test_search_agent_workflow():
 
         # Verify that mock_prisma_tools.document.find_many was called during the tool execution loop
         mock_prisma_tools.document.find_many.assert_called_once_with(where={"projectId": project_id})
-
-        # Cleanup pgvector chunks
-        await pgvector_store.delete_document_chunks(doc_id)
