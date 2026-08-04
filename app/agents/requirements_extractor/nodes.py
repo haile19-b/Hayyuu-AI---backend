@@ -7,6 +7,7 @@ from google import genai
 
 from app.agents.requirements_extractor.schema import ExtractionResponse, SuggestionsResponse
 from app.core.database import prisma
+from prisma import Json
 from app.core.storage import storage_utility
 from app.core.progress import publish_progress
 from prisma.enums import (
@@ -298,7 +299,7 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
             data={
                 "projectId": proj_id,
                 "type": "gap_analysis",
-                "content": json({
+                "content": Json({
                     "title": sug["title"],
                     "description": sug["description"],
                     "reasoning": sug["reasoning"],
