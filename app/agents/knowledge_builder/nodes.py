@@ -117,19 +117,28 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     project_id = state.project_id
     doc_id = state.document_id
 
+    # Segment raw text with chunk index boundaries for source chunk tracking
+    chunks_text_list = []
+    for c in state.chunks:
+        chunks_text_list.append(f"--- Chunk Index: {c.chunk_index} ---\n{c.content}")
+    raw_text_with_boundaries = "\n\n".join(chunks_text_list)
+    if not raw_text_with_boundaries.strip():
+        raw_text_with_boundaries = state.raw_text
+
     prompt = f"""
     You are an expert systems engineering analyst. Your task is to extract all key entities and relationships from the provided context.
 
     Guidelines:
     1. Identify all core entities in the document context. Label them appropriately (e.g., 'Requirement', 'Task', 'Conflict', 'Component', 'Actor', etc.).
-    2. Extract their name, description, and list any other custom attributes (properties) as key-value pairs.
-    3. Identify how they relate to each other. Label relationship types descriptively (e.g. 'OWNS', 'TRACKS', 'CONTAINS', 'IMPLEMENTS', 'CONFLICTS_WITH', 'DEPENDS_ON').
-    4. Connect the entities using their temporary IDs (the 'id' field you assign, such as 'req_1', 'task_login').
-    5. Do not include User, Project, or Document nodes directly in the output list; the pipeline will automatically map and attach them.
+    2. For each entity you extract, identify which chunk index (0-based integer) it belongs to based on the '--- Chunk Index: X ---' markers in the text, and set the `source_chunk_index` property to that index.
+    3. Extract their name, description, and list any other custom attributes (properties) as key-value pairs.
+    4. Identify how they relate to each other. Label relationship types descriptively (e.g. 'OWNS', 'TRACKS', 'CONTAINS', 'IMPLEMENTS', 'CONFLICTS_WITH', 'DEPENDS_ON').
+    5. Connect the entities using their temporary IDs (the 'id' field you assign, such as 'req_1', 'task_login').
+    6. Do not include User, Project, or Document nodes directly in the output list; the pipeline will automatically map and attach them.
 
-    Context to analyze:
+    Context to analyze (segmented by chunk boundaries):
     ---
-    {state.raw_text}
+    {raw_text_with_boundaries}
     ---
     """
 
@@ -193,6 +202,7 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                 label=node.label,
                 name=node.name,
                 description=node.description,
+                source_chunk_index=node.source_chunk_index,
                 properties=node.properties,
             )
         )
@@ -338,6 +348,28 @@ async def store_vectors_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         """
         await neo4j_graph_store.execute_query(sequence_link, {"doc_id": doc_id})
 
+        # Link document to the first chunk of each distinct section path
+        last_section_path = None
+        for c in state.chunks:
+            meta = c.metadata or {}
+            section_path = meta.get("section_path")
+            if section_path and section_path != last_section_path:
+                last_section_path = section_path
+                chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{proj_id}-{doc_id}-chunk-{c.chunk_index}"))
+                section_query = """
+                MATCH (d:Document {id: $doc_id})
+                MATCH (c:Chunk {id: $chunk_uuid})
+                MERGE (d)-[:SECTION {name: $section_name}]->(c)
+                """
+                await neo4j_graph_store.execute_query(
+                    section_query,
+                    {
+                        "doc_id": doc_id,
+                        "chunk_uuid": chunk_uuid,
+                        "section_name": section_path
+                    }
+                )
+
         return {"total_vectors_stored": len(chunk_batch)}
     except Exception as e:
         logger.error(f"Failed storing chunk vectors in Neo4j: {e}")
@@ -386,13 +418,19 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         label = re.sub(r"[^\w]", "", node.label) or "Node"
         node_query = f"""
         MERGE (n:{label} {{id: $id}})
-        ON CREATE SET n.name = $name, n.description = $description, n.created_at = timestamp()
-        ON MATCH SET n.name = $name, n.description = $description
+        ON CREATE SET n.name = $name, n.description = $description, n.project_id = $project_id, n.document_id = $document_id, n.created_at = timestamp()
+        ON MATCH SET n.name = $name, n.description = $description, n.project_id = $project_id, n.document_id = $document_id
         """
         try:
             await neo4j_graph_store.execute_query(
                 node_query,
-                {"id": node.id, "name": node.name, "description": node.description},
+                {
+                    "id": node.id,
+                    "name": node.name,
+                    "description": node.description,
+                    "project_id": project_id,
+                    "document_id": doc_id,
+                },
             )
             
             # Write dynamic properties
@@ -409,6 +447,43 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                         "props": props_dict,
                     },
                 )
+
+            # Link dynamic node to its specific source chunk in Neo4j if available
+            if node.source_chunk_index is not None and doc_id:
+                chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{project_id}-{doc_id}-chunk-{node.source_chunk_index}"))
+                link_query = f"""
+                MATCH (c:Chunk {{id: $chunk_uuid}})
+                MATCH (n:{label} {{id: $node_id}})
+                MERGE (c)-[:HAS_ENTITY]->(n)
+                """
+                await neo4j_graph_store.execute_query(
+                    link_query,
+                    {
+                        "chunk_uuid": chunk_uuid,
+                        "node_id": node.id
+                    }
+                )
+
+            # Fallback substring matching: link any chunks containing the entity's name
+            if doc_id:
+                for c in state.chunks:
+                    if node.source_chunk_index == c.chunk_index:
+                        continue
+                    if len(node.name) > 3 and node.name.lower() in c.content.lower():
+                        chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{project_id}-{doc_id}-chunk-{c.chunk_index}"))
+                        fallback_link_query = f"""
+                        MATCH (c:Chunk {{id: $chunk_uuid}})
+                        MATCH (n:{label} {{id: $node_id}})
+                        MERGE (c)-[:MENTIONS]->(n)
+                        """
+                        await neo4j_graph_store.execute_query(
+                            fallback_link_query,
+                            {
+                                "chunk_uuid": chunk_uuid,
+                                "node_id": node.id
+                            }
+                        )
+
             node_count += 1
         except Exception as e:
             logger.error(f"Failed writing node '{node.name}' of label '{label}': {e}")
