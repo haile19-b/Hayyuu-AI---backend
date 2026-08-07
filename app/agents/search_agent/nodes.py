@@ -1,17 +1,26 @@
 import re
 import logging
+import asyncio
 from typing import List, Dict, Any, Optional
 
 from google.genai import types
 from app.core.config import genAI
 from app.core.database import prisma
 from app.infrastructure.ai.gemini_embedder import gemini_embedder
-from app.infrastructure.vector_store.pgvector import pgvector_store
 from app.infrastructure.graph_store.neo4j import neo4j_graph_store
 
 from app.agents.search_agent.state import SearchAgentState
 from app.agents.search_agent.schemas import VectorSource, GraphNodeRef
-from app.agents.search_agent.tools import relational_db_tool, graph_db_tool
+from app.agents.search_agent.tools import (
+    search_agent_tools,
+    execute_list_project_documents,
+    execute_list_project_requirements,
+    execute_list_project_tasks,
+    execute_list_project_conflicts,
+    execute_list_project_suggestions,
+    execute_traverse_project_subgraph,
+    execute_get_project_graph_summary,
+)
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -170,7 +179,7 @@ async def query_analysis_node(state: SearchAgentState) -> Dict[str, Any]:
 
 # 2. Graph Retrieval Node
 async def graph_retrieval_node(state: SearchAgentState) -> Dict[str, Any]:
-    """Resolves entity titles/IDs and invokes graph_db_tool to fetch Neo4j subgraphs."""
+    """Resolves entity titles/IDs and invokes traverse subgraph utility to fetch Neo4j subgraphs."""
     logger.info("[Node: graph_retrieval] Resolving entity IDs and performing graph traversal...")
     project_id = state.project_id
     query_text = state.query_text
@@ -248,17 +257,16 @@ async def graph_retrieval_node(state: SearchAgentState) -> Dict[str, Any]:
     except Exception as graph_err:
         logger.warning(f"Error pre-matching graph node names: {graph_err}")
 
-    # Invoke Neo4j query helper via graph_db_tool
+    # Invoke Neo4j query helper via execute function directly
     graph_context = ""
     nodes_ref = []
     
     if entity_ids or entity_names:
         try:
-            # Traversal query via tool
-            res = await graph_db_tool(
+            res = await execute_traverse_project_subgraph(
                 project_id=project_id,
-                action="traverse_subgraph",
-                params={"entity_ids": list(entity_ids), "entity_names": list(entity_names)}
+                entity_ids=list(entity_ids),
+                entity_names=list(entity_names)
             )
             graph_context = res.get("context", "")
             node_records = res.get("nodes", [])
@@ -304,12 +312,13 @@ async def graph_retrieval_node(state: SearchAgentState) -> Dict[str, Any]:
 
 # 3. Agent Loop / LLM Node
 async def agent_loop_node(state: SearchAgentState) -> Dict[str, Any]:
-    """Prepares the synthesis prompt and submits it to Gemini, checking for tool requests."""
+    """Prepares the synthesis prompt and submits it to Gemini, checking for parallel tool requests."""
     logger.info("[Node: agent_loop] Submitting chat history and prompt to Gemini...")
     project_id = state.project_id
     query_text = state.query_text
     chunks = state.chunks
     graph_context = state.graph_context
+    postgres_context = state.postgres_context
 
     # Initialize history if empty
     if not state.history:
@@ -318,6 +327,8 @@ async def agent_loop_node(state: SearchAgentState) -> Dict[str, Any]:
             chunks_context += f"Source Chunk #{idx + 1} (Chunk ID: {chunk.id}): (Doc ID: {chunk.documentId})\n{chunk.content}\n\n"
         if not chunks_context:
             chunks_context = "No relevant text documents found."
+            
+        postgres_info = postgres_context.strip() if postgres_context else "No project database records queried yet."
             
         prompt = f"""
 You are Hayyuu AI, a senior systems engineer and product analyst assistant.
@@ -334,6 +345,11 @@ Below is the retrieved context:
 2. Graph Relationship Context (Neo4j subgraphs showing dependencies, requirements, tasks, conflicts, and related entities):
 ---
 {graph_context}
+---
+
+3. Structured Project Records (Database state):
+---
+{postgres_info}
 ---
 
 Active Project ID: {project_id}
@@ -372,7 +388,7 @@ Synthesized Answer:
             model="gemini-3.5-flash",
             contents=history,
             config=types.GenerateContentConfig(
-                tools=[relational_db_tool],
+                tools=search_agent_tools,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 temperature=0.0
             )
@@ -380,7 +396,7 @@ Synthesized Answer:
         
         # Check if the model requested function calls
         if response.function_calls:
-            # We must append the model's tool call candidate content to history
+            # Append the model's tool call candidate content to history
             history.append(response.candidates[0].content)
             return {
                 "history": history,
@@ -400,47 +416,79 @@ Synthesized Answer:
         }
 
 
-# 4. Execute Relational DB Tool Node
+# 4. Execute DB Tool Node
 async def execute_db_tool_node(state: SearchAgentState) -> Dict[str, Any]:
-    """Executes the requested relational database tool calls and returns them to history."""
-    logger.info("[Node: execute_db_tool] Running database Prisma queries for Gemini tool calls...")
+    """Executes all requested database function calls in parallel and returns results to history."""
+    logger.info("[Node: execute_db_tool] Running database queries for Gemini parallel tool calls...")
     history = list(state.history)
     project_id = state.project_id
 
-    # The last content in history is the model's call requesting tools
-    # Let's inspect it to run function responses
     last_content = history[-1]
-    tool_parts = []
-    postgres_context_additions = []
-
-    # Iterate over function calls requested
+    
+    # Collect all execution tasks to run them in parallel
+    tasks = []
+    call_names = []
+    
     for part in last_content.parts:
         if part.function_call:
             call = part.function_call
-            if call.name == "relational_db_tool":
-                logger.info(f"Executing relational database tool with args: {call.args}")
-                result_str = await relational_db_tool(
-                    project_id=call.args.get("project_id") or project_id,
-                    action=call.args.get("action"),
-                    params=call.args.get("params")
-                )
-            else:
-                result_str = f"Unsupported tool: {call.name}"
+            call_names.append(call.name)
             
-            tool_parts.append(
-                types.Part.from_function_response(
-                    name=call.name,
-                    response={"result": result_str}
-                )
-            )
-            postgres_context_additions.append(f"Tool [{call.name}] Output:\n{result_str}\n")
+            # Extract arguments with safe fallback to active project_id
+            args = call.args or {}
+            p_id = args.get("project_id") or project_id
+            
+            # Route to the appropriate execution function
+            if call.name == "list_project_documents":
+                tasks.append(execute_list_project_documents(project_id=p_id))
+            elif call.name == "list_project_requirements":
+                tasks.append(execute_list_project_requirements(project_id=p_id))
+            elif call.name == "list_project_tasks":
+                tasks.append(execute_list_project_tasks(project_id=p_id))
+            elif call.name == "list_project_conflicts":
+                tasks.append(execute_list_project_conflicts(project_id=p_id))
+            elif call.name == "list_project_suggestions":
+                tasks.append(execute_list_project_suggestions(project_id=p_id))
+            elif call.name == "get_project_graph_summary":
+                tasks.append(execute_get_project_graph_summary(project_id=p_id))
+            elif call.name == "traverse_project_subgraph":
+                e_ids = args.get("entity_ids") or []
+                e_names = args.get("entity_names") or []
+                
+                # Wrap traverse helper to extract context string
+                async def run_traverse(pid, ids, names):
+                    res = await execute_traverse_project_subgraph(project_id=pid, entity_ids=ids, entity_names=names)
+                    return res.get("context", "No subgraph found.")
+                
+                tasks.append(run_traverse(p_id, e_ids, e_names))
+            else:
+                # Unsupported tool
+                async def run_unsupported(name):
+                    return f"Unsupported function call: '{name}'"
+                tasks.append(run_unsupported(call.name))
 
-    # Add the tool response content
+    # Execute all queries in parallel
+    results = await asyncio.gather(*tasks)
+    
+    # Build tool response parts
+    tool_parts = []
+    postgres_context_additions = []
+    
+    for idx, name in enumerate(call_names):
+        result_val = results[idx]
+        tool_parts.append(
+            types.Part.from_function_response(
+                name=name,
+                response={"result": result_val}
+            )
+        )
+        postgres_context_additions.append(f"Tool [{name}] Output:\n{result_val}\n")
+
     history.append(types.Content(role="tool", parts=tool_parts))
 
     return {
         "history": history,
-        "postgres_context": state.postgres_context + "\n".join(postgres_context_additions),
+        "postgres_context": state.postgres_context + "\n\n" + "\n".join(postgres_context_additions),
         "status": "tool_executed"
     }
 
@@ -449,7 +497,6 @@ async def execute_db_tool_node(state: SearchAgentState) -> Dict[str, Any]:
 async def validate_response_node(state: SearchAgentState) -> Dict[str, Any]:
     """Validates the generated response for factual consistency and trace mapping."""
     logger.info("[Node: validate_response] Validating synthesized answer for trace-accuracy...")
-    # This is a validation step. If the output is missing, we flag it.
     if not state.answer:
         return {
             "errors": state.errors + ["Validation failed: Synthesized answer is empty."],

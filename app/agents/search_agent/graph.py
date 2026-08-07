@@ -1,4 +1,9 @@
+import logging
+import uuid
+from typing import Dict, Any
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from app.core.env import settings
 
 from app.agents.search_agent.state import SearchAgentState
 from app.agents.search_agent.nodes import (
@@ -8,6 +13,8 @@ from app.agents.search_agent.nodes import (
     execute_db_tool_node,
     validate_response_node,
 )
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def router_conditional_edge(state: SearchAgentState) -> str:
@@ -50,5 +57,24 @@ workflow.add_conditional_edges(
     }
 )
 
-# 6. Compile the Search Agent Graph
+# 6. Compile the Search Agent Graph statically (fallback)
 search_agent_graph = workflow.compile()
+
+
+async def run_search_agent(state: SearchAgentState) -> Dict[str, Any]:
+    """Runs the Search Agent with persistent Postgres state checkpointing."""
+    run_id = str(uuid.uuid4())
+    thread_id = f"{state.project_id}-search-{run_id}"
+    logger.info(f"Running Search Agent checkpointed workflow for thread {thread_id}")
+    
+    # Initialize connection to PostgreSQL for state checkpoints
+    async with AsyncPostgresSaver.from_conn_string(settings.DATABASE_URL) as checkpointer:
+        await checkpointer.setup()
+        
+        # Compile graph with checkpointing
+        graph = workflow.compile(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # Start execution
+        result_state = await graph.ainvoke(state.model_dump(), config=config)
+        return result_state
