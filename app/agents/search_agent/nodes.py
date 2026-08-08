@@ -212,50 +212,34 @@ async def graph_retrieval_node(state: SearchAgentState) -> Dict[str, Any]:
                             for match in uuid_pattern.findall(item):
                                 entity_ids.add(match)
 
-    # Match Requirements & Tasks from DB
+    # Match using Neo4j Full-Text Index (Typo-tolerant Lucene search)
     try:
-        requirements = await prisma.requirement.find_many(where={"projectId": project_id})
-        tasks = await prisma.task.find_many(where={"projectId": project_id})
-    except Exception as db_err:
-        logger.error(f"Error fetching project requirements/tasks: {db_err}")
-        requirements = []
-        tasks = []
-
-    combined_text = (query_text + " " + " ".join([c.content for c in chunks])).lower()
-
-    for req in requirements:
-        req_title = req.title.lower().strip()
-        if req.id in entity_ids or (len(req_title) > 3 and req_title in combined_text):
-            entity_ids.add(req.id)
-            entity_names.add(req.title)
-
-    for task in tasks:
-        task_title = task.title.lower().strip()
-        if task.id in entity_ids or (len(task_title) > 3 and task_title in combined_text):
-            entity_ids.add(task.id)
-            entity_names.add(task.title)
-
-    # Match Neo4j nodes by name directly
-    try:
-        project_nodes_query = """
-        MATCH (p:Project {id: $project_id})-[r]->(n)
-        WHERE n.name IS NOT NULL AND NOT n:Document
-        RETURN n.id as id, n.name as name, labels(n) as labels
-        """
-        graph_nodes_recs = await neo4j_graph_store.execute_query(
-            project_nodes_query,
-            {"project_id": project_id}
-        )
-        for g_node in graph_nodes_recs:
-            g_id = g_node.get("id")
-            g_name = g_node.get("name")
-            if g_id and g_name:
-                g_name_lower = g_name.lower().strip()
-                if len(g_name_lower) > 3 and g_name_lower in combined_text:
-                    entity_ids.add(g_id)
-                    entity_names.add(g_name)
+        # Escape Lucene special syntax characters to avoid query compilation crashes
+        escaped_query = re.sub(r'([+\-&|!(){}\[\]^"~*?:\\/])', r'\\\1', query_text).strip()
+        if escaped_query:
+            # Enforce project_id scoping inside the Lucene index search itself
+            lucene_query = f"project_id:{project_id} AND (name:({escaped_query}) OR description:({escaped_query}))"
+            
+            fulltext_query = """
+            CALL db.index.fulltext.queryNodes('project_entity_fulltext', $lucene_query) YIELD node, score
+            WHERE score > 0.35
+            RETURN node.id as id, node.name as name
+            LIMIT 30
+            """
+            
+            records = await neo4j_graph_store.execute_query(
+                fulltext_query,
+                {"lucene_query": lucene_query}
+            )
+            for r in records:
+                e_id = r.get("id")
+                e_name = r.get("name")
+                if e_id:
+                    entity_ids.add(e_id)
+                if e_name:
+                    entity_names.add(e_name)
     except Exception as graph_err:
-        logger.warning(f"Error pre-matching graph node names: {graph_err}")
+        logger.warning(f"Error performing full-text entity search: {graph_err}")
 
     # Invoke Neo4j query helper via execute function directly
     graph_context = ""

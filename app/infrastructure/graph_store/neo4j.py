@@ -83,8 +83,19 @@ class Neo4jGraphStore:
             except Exception as e:
                 logger.error(f"Error creating vector index chunk_vector_index: {e}")
                 raise e
+
+            # Create full-text index on Entity nodes for fuzzy lookup
+            fulltext_index_query = """
+            CREATE FULLTEXT INDEX project_entity_fulltext IF NOT EXISTS
+            FOR (e:Entity) ON EACH [e.name, e.description, e.project_id]
+            """
+            try:
+                await session.run(fulltext_index_query)
+            except Exception as e:
+                logger.error(f"Error creating full-text index project_entity_fulltext: {e}")
+                raise e
                 
-        logger.info("✅ Neo4j unique constraints and vector index initialized successfully.")
+        logger.info("✅ Neo4j unique constraints, vector, and full-text indexes initialized successfully.")
 
     async def execute_query(
         self,

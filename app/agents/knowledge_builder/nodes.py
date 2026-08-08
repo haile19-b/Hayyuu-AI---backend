@@ -417,7 +417,7 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         # Safe formatting because label is vetted as alphanumeric/extracted by LLM
         label = re.sub(r"[^\w]", "", node.label) or "Node"
         node_query = f"""
-        MERGE (n:{label} {{id: $id}})
+        MERGE (n:Entity:{label} {{id: $id}})
         ON CREATE SET n.name = $name, n.description = $description, n.project_id = $project_id, n.document_id = $document_id, n.created_at = timestamp()
         ON MATCH SET n.name = $name, n.description = $description, n.project_id = $project_id, n.document_id = $document_id
         """
