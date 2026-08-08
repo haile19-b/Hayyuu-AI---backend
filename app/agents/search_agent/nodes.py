@@ -101,14 +101,24 @@ async def query_analysis_node(state: SearchAgentState) -> Dict[str, Any]:
         # Perform query embedding
         query_vector = gemini_embedder.embed_text(query_text, user_query=True)
         
-        # Cypher query for native vector search + sequential window expansion
+        # Cypher query for native vector search + graph entity enrichment + sequential window expansion
         cypher = """
         CALL db.index.vector.queryNodes('chunk_vector_index', $top_k, $query_vector) YIELD node, score
         WHERE node.project_id = $project_id
           AND ($document_id IS NULL OR node.document_id = $document_id)
           AND score > 0.6
+        
+        OPTIONAL MATCH (node)-[rel:HAS_ENTITY|MENTIONS]->(e:Entity)
+        WITH node, score, collect(DISTINCT {
+             name: e.name, 
+             label: labels(e)[0], 
+             id: e.id, 
+             rel: type(rel)
+        }) as entities
+        
         OPTIONAL MATCH (prev:Chunk)-[:NEXT]->(node)
         OPTIONAL MATCH (node)-[:NEXT]->(next:Chunk)
+        
         RETURN node.id as id,
                node.document_id as document_id,
                node.project_id as project_id,
@@ -117,7 +127,8 @@ async def query_analysis_node(state: SearchAgentState) -> Dict[str, Any]:
                prev.content as prev_content,
                next.content as next_content,
                node.metadata as metadata,
-               score as similarity
+               score as similarity,
+               entities
         ORDER BY similarity DESC
         """
         
@@ -139,6 +150,20 @@ async def query_analysis_node(state: SearchAgentState) -> Dict[str, Any]:
             prev_txt = r.get("prev_content")
             curr_txt = r.get("content") or ""
             next_txt = r.get("next_content")
+            
+            # Sub-Graph Context Injection (Lesson 6 Pattern)
+            entity_summary = []
+            for ent in r.get("entities") or []:
+                ent_name = ent.get("name")
+                ent_label = ent.get("label") or "Entity"
+                ent_id = ent.get("id")
+                ent_rel = ent.get("rel")
+                if ent_name and ent_id:
+                    rel_type = "primary source for" if ent_rel == "HAS_ENTITY" else "mentions"
+                    entity_summary.append(f"{ent_label} '{ent_name}' [ID: {ent_id}] ({rel_type})")
+            
+            if entity_summary:
+                combined_content += f"[Graph Context: This chunk {', and '.join(entity_summary)}]\n---\n"
             
             if prev_txt:
                 combined_content += prev_txt.strip() + " \n "
