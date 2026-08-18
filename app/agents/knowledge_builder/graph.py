@@ -1,4 +1,7 @@
-from langgraph.graph import StateGraph, END
+import logging
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from app.core.env import settings
 
 from app.agents.knowledge_builder.state import KnowledgeBuilderState
 from app.agents.knowledge_builder.nodes import (
@@ -9,6 +12,8 @@ from app.agents.knowledge_builder.nodes import (
     store_graph_node,
     save_results_node,
 )
+
+logger = logging.getLogger("uvicorn.error")
 
 # Define workflow
 workflow = StateGraph(KnowledgeBuilderState)
@@ -32,5 +37,29 @@ workflow.add_edge("store_vectors", "store_graph")
 workflow.add_edge("store_graph", "save_results")
 workflow.add_edge("save_results", END)
 
-# Compile the agent graph
+# Compile the agent graph (for static/backward compatibility reference)
 knowledge_builder_graph = workflow.compile()
+
+async def run_knowledge_builder(state: KnowledgeBuilderState) -> None:
+    """Executes the Knowledge Builder workflow with persistent Postgres checkpointing."""
+    thread_id = f"{state.document_id}-kb" if state.document_id else f"{state.project_id}-kb"
+    logger.info(f"Running Knowledge Builder checkpointed workflow for thread {thread_id}")
+    
+    # Initialize persistent state checkpointer
+    async with AsyncPostgresSaver.from_conn_string(settings.DATABASE_URL) as checkpointer:
+        await checkpointer.setup()
+        
+        # Compile graph with saver checkpointer
+        graph = workflow.compile(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
+        
+        # Verify if checkpoint exists to resume
+        kb_state = await graph.aget_state(config)
+        if kb_state and kb_state.next:
+            logger.info(f"Resuming Knowledge Builder for {thread_id} from node: {kb_state.next}")
+            await graph.ainvoke(None, config=config)
+        elif kb_state and not kb_state.next and kb_state.values:
+            logger.info(f"Knowledge Builder already completed for {thread_id}. Skipping.")
+        else:
+            logger.info(f"Starting fresh Knowledge Builder execution for {thread_id}")
+            await graph.ainvoke(state.model_dump(), config=config)

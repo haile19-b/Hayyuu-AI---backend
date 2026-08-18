@@ -7,7 +7,7 @@ from app.domain.entities.auth.auth_schema import ApiResponse
 
 from app.agents.search_agent.schemas import ChatRequest, ChatResponse
 from app.agents.search_agent.state import SearchAgentState
-from app.agents.search_agent.graph import search_agent_graph
+from app.agents.search_agent.graph import run_search_agent
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -41,7 +41,7 @@ async def chat_with_project(
             response.status_code = status.HTTP_403_FORBIDDEN
             return {"success": False, "error": "Unauthorized"}
 
-        # Invoke the LangGraph Search Agent
+        # Invoke the LangGraph Search Agent with postgres checkpointing
         logger.info(f"Invoking search agent graph for project {project_id}")
         state = SearchAgentState(
             project_id=project_id,
@@ -50,7 +50,7 @@ async def chat_with_project(
             limit=body.limit or 5
         )
 
-        result_state = await search_agent_graph.ainvoke(state)
+        result_state = await run_search_agent(state)
 
         # Check for errors in state
         if result_state.get("errors"):

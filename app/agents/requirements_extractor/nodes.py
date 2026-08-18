@@ -3,7 +3,6 @@ import json
 import os
 import anyio
 from io import BytesIO
-from pydantic import BaseModel, Field
 from google import genai
 
 from app.agents.requirements_extractor.schema import ExtractionResponse, SuggestionsResponse
@@ -22,11 +21,11 @@ from app.core.config import genAI
 
 logger = logging.getLogger("uvicorn.error")
 
-# Node 1: Upload Document to Gemini Files API (Bypassing local text extraction)
-async def extract_text_node(state: DocumentAnalysisState) -> dict:
+# Node 1: Ingest and Upload Original Document to Gemini Files API
+async def ingest_document_node(state: DocumentAnalysisState) -> dict:
     doc_id = state["document_id"]
-    logger.info(f"[Node: extract_text] Uploading document directly to Gemini Files API for {doc_id}")
-    await publish_progress(doc_id, "Preparing document ingestion...", "extract_text")
+    logger.info(f"[Node: ingest_document] Uploading document directly to Gemini Files API for {doc_id}")
+    await publish_progress(doc_id, "Preparing document ingestion...", "ingest_document")
     
     # 1. Fetch document metadata
     document = await prisma.document.find_unique(where={"id": doc_id})
@@ -34,11 +33,11 @@ async def extract_text_node(state: DocumentAnalysisState) -> dict:
         raise ValueError(f"Document with ID {doc_id} not found in database")
         
     # 2. Download raw file content
-    await publish_progress(doc_id, f"Downloading file '{document.name}' from storage...", "extract_text")
+    await publish_progress(doc_id, f"Downloading file '{document.name}' from storage...", "ingest_document")
     file_bytes = await storage_utility.download_file(document.filePath)
     
     # 3. Upload file to Gemini Files API for native multi-page document understanding
-    await publish_progress(doc_id, "Uploading document to Gemini Files API...", "extract_text")
+    await publish_progress(doc_id, "Uploading document to Gemini Files API...", "ingest_document")
     def _upload():
         return genAI.files.upload(
             file=BytesIO(file_bytes),
@@ -46,10 +45,9 @@ async def extract_text_node(state: DocumentAnalysisState) -> dict:
         )
     gemini_file = await anyio.to_thread.run_sync(_upload)
     logger.info(f"Successfully uploaded document to Gemini. URI: {gemini_file.uri}")
-    await publish_progress(doc_id, "Document successfully uploaded to Gemini Files API.", "extract_text")
+    await publish_progress(doc_id, "Document successfully uploaded to Gemini.", "ingest_document")
     
     return {
-        "extracted_text": "",
         "gemini_file_uri": gemini_file.uri,
         "gemini_file_mime_type": gemini_file.mime_type
     }
@@ -62,12 +60,12 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     file_mime_type = state.get("gemini_file_mime_type")
     
     logger.info(f"[Node: extract_requirements] Performing joint extraction of requirements, tasks, and conflicts for {doc_id}")
-    await publish_progress(doc_id, "Fetching project details and checking for conflicts...", "extract_requirements")
     
     if not file_uri:
-        raise ValueError("Gemini file URI is missing. Cannot perform native document understanding.")
+        raise ValueError("Gemini file URI is missing. Ingestion node must run first.")
         
     # 1. Retrieve existing project requirements from DB to check for conflicts
+    await publish_progress(doc_id, "Checking existing project requirements for conflicts...", "extract_requirements")
     existing_reqs = await prisma.requirement.find_many(where={"projectId": proj_id})
     existing_reqs_text = ""
     if existing_reqs:
@@ -124,6 +122,7 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     temp_id_to_uuid = {}
     req_created = 0
     task_created = 0
+    req_created_ids = []
     
     for req in reqs:
         # Map requirement type
@@ -149,6 +148,7 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
             }
         )
         temp_id_to_uuid[req["temp_id"]] = db_req.id
+        req_created_ids.append(db_req.id)
         req_created += 1
         
         # Create associated developer tasks (as PENDING approval status)
@@ -237,30 +237,12 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
         step="extract_requirements"
     )
     logger.info(f"Saved {req_created} requirements, {task_created} tasks, and {conflicts_created} conflicts in DB")
-    return {}
+    
+    return {
+        "extracted_requirement_ids": req_created_ids
+    }
 
-# Node 3: Chunk & Embed Document (Skipped)
-async def chunk_and_embed_node(state: DocumentAnalysisState) -> dict:
-    doc_id = state["document_id"]
-    logger.info(f"[Node: chunk_and_embed] Skipping vectorDB node.")
-    await publish_progress(doc_id, "Skipping chunking and vector store ingestion...", "chunk_and_embed")
-    return {}
-
-# Node 4: Detect Conflicts (Skipped, handled jointly in Node 2)
-async def detect_conflicts_node(state: DocumentAnalysisState) -> dict:
-    doc_id = state["document_id"]
-    logger.info(f"[Node: detect_conflicts] Skipping standalone conflict detection node (processed jointly in Node 2).")
-    await publish_progress(doc_id, "Skipping conflict detection node (processed jointly)...", "detect_conflicts")
-    return {}
-
-# Node 5: Create Tasks (Skipped, handled jointly in Node 2)
-async def create_tasks_node(state: DocumentAnalysisState) -> dict:
-    doc_id = state["document_id"]
-    logger.info(f"[Node: create_tasks] Skipping task creation node (processed jointly in Node 2).")
-    await publish_progress(doc_id, "Skipping task creation node...", "create_tasks")
-    return {}
-
-# Node 6: Generate suggestions (Gap Analysis Suggestions)
+# Node 3: Generate suggestions (Gap Analysis Suggestions)
 async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
     doc_id = state["document_id"]
     proj_id = state["project_id"]

@@ -8,11 +8,8 @@ from prisma.enums import DocumentStatus
 
 from app.agents.requirements_extractor.state import DocumentAnalysisState
 from app.agents.requirements_extractor.nodes import (
-    extract_text_node,
+    ingest_document_node,
     extract_requirements_node,
-    chunk_and_embed_node,
-    detect_conflicts_node,
-    create_tasks_node,
     generate_suggestions_node,
 )
 
@@ -20,19 +17,13 @@ logger = logging.getLogger("uvicorn.error")
 
 # Build Graph
 builder = StateGraph(DocumentAnalysisState)
-builder.add_node("extract_text", extract_text_node)
+builder.add_node("ingest_document", ingest_document_node)
 builder.add_node("extract_requirements", extract_requirements_node)
-builder.add_node("chunk_and_embed", chunk_and_embed_node)
-builder.add_node("detect_conflicts", detect_conflicts_node)
-builder.add_node("create_tasks", create_tasks_node)
 builder.add_node("generate_suggestions", generate_suggestions_node)
 
-builder.add_edge(START, "extract_text")
-builder.add_edge("extract_text", "extract_requirements")
-builder.add_edge("extract_requirements", "chunk_and_embed")
-builder.add_edge("chunk_and_embed", "detect_conflicts")
-builder.add_edge("detect_conflicts", "create_tasks")
-builder.add_edge("create_tasks", "generate_suggestions")
+builder.add_edge(START, "ingest_document")
+builder.add_edge("ingest_document", "extract_requirements")
+builder.add_edge("extract_requirements", "generate_suggestions")
 builder.add_edge("generate_suggestions", END)
 
 async def run_workflow(document_id: str, project_id: str) -> None:
@@ -61,8 +52,7 @@ async def run_workflow(document_id: str, project_id: str) -> None:
             logger.info(f"Starting new document analysis workflow execution for {document_id}")
             initial_state = {
                 "project_id": project_id,
-                "document_id": document_id,
-                "extracted_text": ""
+                "document_id": document_id
             }
             await graph.ainvoke(initial_state, config=config)
             
@@ -76,7 +66,7 @@ async def run_workflow(document_id: str, project_id: str) -> None:
         gemini_file_mime_type = state_after.values.get("gemini_file_mime_type") if state_after else None
 
         # 3. Trigger Agent Knowledge Builder dynamically to build PGVector and Neo4j indices
-        from app.agents.knowledge_builder.graph import knowledge_builder_graph
+        from app.agents.knowledge_builder.graph import run_knowledge_builder
         from app.agents.knowledge_builder.state import KnowledgeBuilderState
         
         logger.info(f"Triggering Agent Knowledge Builder for document {document_id}")
@@ -89,7 +79,7 @@ async def run_workflow(document_id: str, project_id: str) -> None:
             gemini_file_uri=gemini_file_uri,
             gemini_file_mime_type=gemini_file_mime_type,
         )
-        await knowledge_builder_graph.ainvoke(kb_state)
+        await run_knowledge_builder(kb_state)
             
         # Update document status in the database to INDEXED upon successful completion
         await prisma.document.update(
