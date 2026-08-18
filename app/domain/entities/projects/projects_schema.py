@@ -11,7 +11,9 @@ from prisma.enums import (
     TaskPriority,
     TaskSource,
     TaskApprovalStatus,
-    SuggestionStatus
+    SuggestionStatus,
+    ConflictSeverity,
+    ConflictStatus
 )
 from app.domain.entities.auth.auth_schema import ApiResponse
 
@@ -93,3 +95,49 @@ class AISuggestionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+class CreateRequirementRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: str
+    type: RequirementType = RequirementType.FUNCTIONAL
+    priority: RequirementPriority = RequirementPriority.P2
+
+class UpdateRequirementRequest(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    type: Optional[RequirementType] = None
+    priority: Optional[RequirementPriority] = None
+    status: Optional[RequirementStatus] = None
+    isConflicted: Optional[bool] = None
+
+class CreateTaskRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: str
+    requirementId: Optional[str] = None
+    priority: TaskPriority = TaskPriority.P2
+    status: TaskStatus = TaskStatus.TODO
+
+class UpdateTaskRequest(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    requirementId: Optional[str] = None
+    priority: Optional[TaskPriority] = None
+    status: Optional[TaskStatus] = None
+
+class ConflictResponse(BaseModel):
+    id: str
+    projectId: str
+    requirementId: str
+    conflictingRequirementId: str
+    severity: ConflictSeverity
+    description: str
+    aiRecommendation: Optional[str] = None
+    status: ConflictStatus
+    createdAt: datetime.datetime
+    updatedAt: datetime.datetime
+
+    class Config:
+        from_attributes = True
+
+class ResolveConflictRequest(BaseModel):
+    status: ConflictStatus

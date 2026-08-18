@@ -20,8 +20,36 @@ async def lifespan(app: FastAPI):
     # 1. Startup: Connect to DB and Redis
     await connect_db()
     await connect_redis()
+
+    # Start programmatic arq worker inside the FastAPI event loop using async_run
+    from arq.worker import create_worker
+    from app.core.queue import WorkerSettings
+    
+    try:
+        worker = create_worker(WorkerSettings)
+        worker_task = asyncio.create_task(worker.async_run())
+        app.state.worker = worker
+        app.state.worker_task = worker_task
+    except Exception as worker_err:
+        import logging
+        logger = logging.getLogger("uvicorn.error")
+        logger.error(f"⚠️ Could not start arq worker programmatically: {worker_err}. Background worker features disabled.")
+
     yield
     # 2. Shutdown: Disconnect from DB and Redis
+    if hasattr(app.state, "worker"):
+        try:
+            await app.state.worker.close()
+        except Exception:
+            pass
+
+    if hasattr(app.state, "worker_task"):
+        app.state.worker_task.cancel()
+        try:
+            await app.state.worker_task
+        except asyncio.CancelledError:
+            pass
+
     await disconnect_db()
     await disconnect_redis()
 

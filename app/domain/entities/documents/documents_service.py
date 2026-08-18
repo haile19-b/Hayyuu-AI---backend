@@ -20,11 +20,21 @@ class DocumentsService:
             if not project_res.get("success"):
                 return project_res
 
-            # 2. Upload file to R2 / S3
+            # 2. Upload file to R2 / S3 with local disk fallback
             unique_id = uuid.uuid4().hex
             file_path = f"projects/{project_id}/documents/{unique_id}_{file_name}"
             
-            await storage_utility.upload_file(file_content, file_path, content_type)
+            try:
+                await storage_utility.upload_file(file_content, file_path, content_type)
+            except Exception as s3_err:
+                import os
+                print(f"S3/R2 upload failed: {s3_err}. Falling back to local storage.")
+                local_dir = os.path.join("uploads", project_id)
+                os.makedirs(local_dir, exist_ok=True)
+                local_path = os.path.join(local_dir, f"{unique_id}_{file_name}")
+                with open(local_path, "wb") as f:
+                    f.write(file_content)
+                file_path = local_path
 
             # 3. Save document record in the database
             document = await prisma.document.create(

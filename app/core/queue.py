@@ -19,14 +19,23 @@ async def connect_redis() -> None:
     """Connect to Redis and initialize the global pool."""
     global redis_pool
     if redis_pool is None:
-        redis_pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
-        logger.info("✅ Redis Pool Connected Successfully")
+        try:
+            # Set a shorter connection timeout for quick fallback
+            settings_obj = RedisSettings.from_dsn(settings.REDIS_URL)
+            redis_pool = await create_pool(settings_obj)
+            logger.info("✅ Redis Pool Connected Successfully")
+        except Exception as e:
+            logger.error(f"⚠️ Failed to connect to Redis: {e}. Background tasks will be disabled.")
+            redis_pool = None
 
 async def disconnect_redis() -> None:
     """Close the global Redis pool connection."""
     global redis_pool
     if redis_pool is not None:
-        await redis_pool.close()
+        try:
+            await redis_pool.close()
+        except Exception:
+            pass
         redis_pool = None
         logger.info("🛑 Redis Pool Disconnected Successfully")
 
@@ -37,8 +46,15 @@ async def enqueue_document_analysis(document_id: str, project_id: str) -> None:
     global redis_pool
     if redis_pool is None:
         await connect_redis()
-    await redis_pool.enqueue_job("analyze_document_job", document_id, project_id)
-    logger.info(f"Enqueued document analysis job for document {document_id}")
+    
+    if redis_pool is not None:
+        try:
+            await redis_pool.enqueue_job("analyze_document_job", document_id, project_id)
+            logger.info(f"Enqueued document analysis job for document {document_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to enqueue document analysis to Redis: {e}")
+    else:
+        logger.warning(f"⚠️ Redis is offline. Document {document_id} analysis cannot be enqueued.")
 
 from prisma.enums import DocumentStatus
 from app.core.database import prisma
