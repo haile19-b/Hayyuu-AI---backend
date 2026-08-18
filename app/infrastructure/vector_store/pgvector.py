@@ -135,34 +135,65 @@ class PGVectorStore:
         """
         async with await self.get_connection() as conn:
             async with conn.cursor() as cur:
+            
                 if document_id:
                     query = """
-                        SELECT id, document_id, project_id, chunk_index, content, metadata,
-                               (embedding <=> %s::vector) AS distance
-                        FROM document_chunks
-                        WHERE project_id = %s AND document_id = %s
-                        ORDER BY distance ASC
-                        LIMIT %s;
-                    """
-                    params = (query_vector, project_id, document_id, top_k)
-                else:
-                    query = """
-                        SELECT id, document_id, project_id, chunk_index, content, metadata,
-                               (embedding <=> %s::vector) AS distance
+                        SELECT 
+                            id,
+                            document_id,
+                            project_id,
+                            chunk_index,
+                            content,
+                            metadata,
+                            1 - (embedding <=> %s::vector) AS similarity
                         FROM document_chunks
                         WHERE project_id = %s
-                        ORDER BY distance ASC
+                          AND document_id = %s
+                          AND 1 - (embedding <=> %s::vector) > 0.7
+                        ORDER BY similarity DESC
                         LIMIT %s;
                     """
-                    params = (query_vector, project_id, top_k)
-
+        
+                    params = (
+                        query_vector,   # SELECT similarity
+                        project_id,
+                        document_id,
+                        query_vector,   # WHERE similarity filter
+                        top_k,
+                    )
+        
+                else:
+                    query = """
+                        SELECT 
+                            id,
+                            document_id,
+                            project_id,
+                            chunk_index,
+                            content,
+                            metadata,
+                            1 - (embedding <=> %s::vector) AS similarity
+                        FROM document_chunks
+                        WHERE project_id = %s
+                          AND 1 - (embedding <=> %s::vector) > 0.7
+                        ORDER BY similarity DESC
+                        LIMIT %s;
+                    """
+        
+                    params = (
+                        query_vector,   # SELECT similarity
+                        project_id,
+                        query_vector,   # WHERE similarity filter
+                        top_k,
+                    )
+        
                 await cur.execute(query, params)
                 rows = await cur.fetchall()
-
+        
                 results = []
+        
                 for row in rows:
-                    distance = float(row[6])
-                    similarity = max(0.0, 1.0 - distance)
+                    similarity = float(row[6])
+        
                     results.append(
                         {
                             "id": str(row[0]),
@@ -171,12 +202,11 @@ class PGVectorStore:
                             "chunk_index": row[3],
                             "content": row[4],
                             "metadata": row[5],
-                            "distance": distance,
                             "similarity": similarity,
                         }
                     )
+        
                 return results
-
     async def delete_document_chunks(self, document_id: str) -> int:
         """Delete all chunks belonging to a document."""
         async with await self.get_connection() as conn:
