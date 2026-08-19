@@ -17,9 +17,14 @@ class ProjectsService:
                     "status": ProjectStatus.ACTIVE
                 }
             )
+            p_dict = project.dict()
+            p_dict["documentsCount"] = 0
+            p_dict["requirementsCount"] = 0
+            p_dict["tasksCount"] = 0
+            p_dict["conflictsCount"] = 0
             return {
                 "success": True,
-                "response": project
+                "response": p_dict
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -32,11 +37,25 @@ class ProjectsService:
                 where_clause["status"] = status
                 
             projects = await prisma.project.find_many(
-                where=where_clause
+                where=where_clause,
+                include={
+                    "documents": True,
+                    "requirements": True,
+                    "tasks": True,
+                    "conflicts": True,
+                }
             )
+            response_list = []
+            for p in projects:
+                p_dict = p.dict()
+                p_dict["documentsCount"] = len(p.documents) if p.documents is not None else 0
+                p_dict["requirementsCount"] = len(p.requirements) if p.requirements is not None else 0
+                p_dict["tasksCount"] = len(p.tasks) if p.tasks is not None else 0
+                p_dict["conflictsCount"] = len(p.conflicts) if p.conflicts is not None else 0
+                response_list.append(p_dict)
             return {
                 "success": True,
-                "response": projects
+                "response": response_list
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -45,15 +64,27 @@ class ProjectsService:
     async def get_project_by_id(project_id: str, user_id: str) -> dict:
         try:
             project = await prisma.project.find_unique(
-                where={"id": project_id}
+                where={"id": project_id},
+                include={
+                    "documents": True,
+                    "requirements": True,
+                    "tasks": True,
+                    "conflicts": True,
+                }
             )
             if not project:
                 return {"success": False, "error": "Project not found"}
             if project.userId != user_id:
                 return {"success": False, "error": "Unauthorized"}
+
+            p_dict = project.dict()
+            p_dict["documentsCount"] = len(project.documents) if project.documents is not None else 0
+            p_dict["requirementsCount"] = len(project.requirements) if project.requirements is not None else 0
+            p_dict["tasksCount"] = len(project.tasks) if project.tasks is not None else 0
+            p_dict["conflictsCount"] = len(project.conflicts) if project.conflicts is not None else 0
             return {
                 "success": True,
-                "response": project
+                "response": p_dict
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -84,11 +115,22 @@ class ProjectsService:
 
             updated = await prisma.project.update(
                 where={"id": project_id},
-                data=update_data
+                data=update_data,
+                include={
+                    "documents": True,
+                    "requirements": True,
+                    "tasks": True,
+                    "conflicts": True,
+                }
             )
+            u_dict = updated.dict()
+            u_dict["documentsCount"] = len(updated.documents) if updated.documents is not None else 0
+            u_dict["requirementsCount"] = len(updated.requirements) if updated.requirements is not None else 0
+            u_dict["tasksCount"] = len(updated.tasks) if updated.tasks is not None else 0
+            u_dict["conflictsCount"] = len(updated.conflicts) if updated.conflicts is not None else 0
             return {
                 "success": True,
-                "response": updated
+                "response": u_dict
             }
         except Exception as e:
             return {"success": False, "error": str(e)}

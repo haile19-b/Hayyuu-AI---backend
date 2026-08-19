@@ -1,5 +1,5 @@
 import logging
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, Response, status, Request
 
 from app.core.database import prisma
 from app.middleware.auth_middleware import auth_middleware
@@ -19,6 +19,7 @@ async def chat_with_project(
     project_id: str,
     body: ChatRequest,
     response: Response,
+    request: Request,
     credentials = Depends(auth_middleware)
 ):
     """
@@ -50,7 +51,8 @@ async def chat_with_project(
             limit=body.limit or 5
         )
 
-        result_state = await run_search_agent(state)
+        mcp_manager = getattr(request.app.state, "mcp_manager", None)
+        result_state = await run_search_agent(state, mcp_manager)
 
         # Check for errors in state
         if result_state.get("errors"):

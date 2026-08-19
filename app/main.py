@@ -13,13 +13,24 @@ import uvicorn
 from app.core.env import settings
 from app.core.database import connect_db, disconnect_db
 from app.core.queue import connect_redis, disconnect_redis
+from app.infrastructure.mcp.client_manager import MCPClientManager
 from app.interfaces.api.v1.routes import route as api_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Startup: Connect to DB and Redis
+    # 1. Startup: Connect to DB, Redis, and MCP Servers
     await connect_db()
     await connect_redis()
+
+    # Connect to MCP Servers
+    mcp_manager = MCPClientManager()
+    try:
+        await mcp_manager.connect_all()
+        app.state.mcp_manager = mcp_manager
+    except Exception as mcp_err:
+        import logging
+        logger = logging.getLogger("uvicorn.error")
+        logger.error(f"⚠️ Could not connect to MCP Servers: {mcp_err}")
 
     # Start programmatic arq worker inside the FastAPI event loop using async_run
     from arq.worker import create_worker
@@ -36,7 +47,13 @@ async def lifespan(app: FastAPI):
         logger.error(f"⚠️ Could not start arq worker programmatically: {worker_err}. Background worker features disabled.")
 
     yield
-    # 2. Shutdown: Disconnect from DB and Redis
+    # 2. Shutdown: Disconnect from DB, Redis, and MCP Client sessions
+    if hasattr(app.state, "mcp_manager"):
+        try:
+            await app.state.mcp_manager.close()
+        except Exception:
+            pass
+
     if hasattr(app.state, "worker"):
         try:
             await app.state.worker.close()

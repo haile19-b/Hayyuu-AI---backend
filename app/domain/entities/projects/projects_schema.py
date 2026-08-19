@@ -34,6 +34,10 @@ class ProjectResponse(BaseModel):
     status: ProjectStatus
     createdAt: datetime.datetime
     updatedAt: datetime.datetime
+    documentsCount: int = 0
+    requirementsCount: int = 0
+    tasksCount: int = 0
+    conflictsCount: int = 0
 
     class Config:
         from_attributes = True

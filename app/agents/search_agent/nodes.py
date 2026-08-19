@@ -12,14 +12,7 @@ from app.infrastructure.graph_store.neo4j import neo4j_graph_store
 from app.agents.search_agent.state import SearchAgentState
 from app.agents.search_agent.schemas import VectorSource, GraphNodeRef
 from app.agents.search_agent.tools import (
-    search_agent_tools,
-    execute_list_project_documents,
-    execute_list_project_requirements,
-    execute_list_project_tasks,
-    execute_list_project_conflicts,
-    execute_list_project_suggestions,
     execute_traverse_project_subgraph,
-    execute_get_project_graph_summary,
 )
 
 logger = logging.getLogger("uvicorn.error")
@@ -320,7 +313,7 @@ async def graph_retrieval_node(state: SearchAgentState) -> Dict[str, Any]:
 
 
 # 3. Agent Loop / LLM Node
-async def agent_loop_node(state: SearchAgentState) -> Dict[str, Any]:
+async def agent_loop_node(state: SearchAgentState, config: dict = None) -> Dict[str, Any]:
     """Prepares the synthesis prompt and submits it to Gemini, checking for parallel tool requests."""
     logger.info("[Node: agent_loop] Submitting chat history and prompt to Gemini...")
     project_id = state.project_id
@@ -328,6 +321,8 @@ async def agent_loop_node(state: SearchAgentState) -> Dict[str, Any]:
     chunks = state.chunks
     graph_context = state.graph_context
     postgres_context = state.postgres_context
+
+    mcp_manager = config.get("configurable", {}).get("mcp_manager") if config else None
 
     # Initialize history if empty
     if not state.history:
@@ -392,12 +387,26 @@ Synthesized Answer:
     else:
         history = list(state.history)
 
+    # Compile dynamic tool definitions from MCP Manager
+    gemini_tools = None
+    if mcp_manager and mcp_manager.available_tools:
+        declarations = []
+        for t in mcp_manager.available_tools:
+            declarations.append(
+                types.FunctionDeclaration(
+                    name=t["name"],
+                    description=t["description"],
+                    parameters_json_schema=t["input_schema"]
+                )
+            )
+        gemini_tools = [types.Tool(function_declarations=declarations)]
+
     try:
         response = genAI.models.generate_content(
             model="gemini-3.5-flash",
             contents=history,
             config=types.GenerateContentConfig(
-                tools=search_agent_tools,
+                tools=gemini_tools,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 temperature=0.0
             )
@@ -426,12 +435,19 @@ Synthesized Answer:
 
 
 # 4. Execute DB Tool Node
-async def execute_db_tool_node(state: SearchAgentState) -> Dict[str, Any]:
-    """Executes all requested database function calls in parallel and returns results to history."""
-    logger.info("[Node: execute_db_tool] Running database queries for Gemini parallel tool calls...")
+async def execute_db_tool_node(state: SearchAgentState, config: dict = None) -> Dict[str, Any]:
+    """Executes all requested database function calls in parallel using MCP and returns results to history."""
+    logger.info("[Node: execute_db_tool] Running MCP parallel tool calls...")
+    mcp_manager = config.get("configurable", {}).get("mcp_manager") if config else None
+    if not mcp_manager:
+        logger.error("MCPClientManager not found in config context.")
+        return {
+            "errors": state.errors + ["MCP client manager context is missing."],
+            "status": "failed"
+        }
+
     history = list(state.history)
     project_id = state.project_id
-
     last_content = history[-1]
     
     # Collect all execution tasks to run them in parallel
@@ -444,40 +460,15 @@ async def execute_db_tool_node(state: SearchAgentState) -> Dict[str, Any]:
             call_names.append(call.name)
             
             # Extract arguments with safe fallback to active project_id
-            args = call.args or {}
-            p_id = args.get("project_id") or project_id
+            args = dict(call.args) if call.args else {}
+            if "project_id" not in args:
+                args["project_id"] = project_id
             
-            # Route to the appropriate execution function
-            if call.name == "list_project_documents":
-                tasks.append(execute_list_project_documents(project_id=p_id))
-            elif call.name == "list_project_requirements":
-                tasks.append(execute_list_project_requirements(project_id=p_id))
-            elif call.name == "list_project_tasks":
-                tasks.append(execute_list_project_tasks(project_id=p_id))
-            elif call.name == "list_project_conflicts":
-                tasks.append(execute_list_project_conflicts(project_id=p_id))
-            elif call.name == "list_project_suggestions":
-                tasks.append(execute_list_project_suggestions(project_id=p_id))
-            elif call.name == "get_project_graph_summary":
-                tasks.append(execute_get_project_graph_summary(project_id=p_id))
-            elif call.name == "traverse_project_subgraph":
-                e_ids = args.get("entity_ids") or []
-                e_names = args.get("entity_names") or []
-                
-                # Wrap traverse helper to extract context string
-                async def run_traverse(pid, ids, names):
-                    res = await execute_traverse_project_subgraph(project_id=pid, entity_ids=ids, entity_names=names)
-                    return res.get("context", "No subgraph found.")
-                
-                tasks.append(run_traverse(p_id, e_ids, e_names))
-            else:
-                # Unsupported tool
-                async def run_unsupported(name):
-                    return f"Unsupported function call: '{name}'"
-                tasks.append(run_unsupported(call.name))
+            # Execute tool call asynchronously via MCP client
+            tasks.append(mcp_manager.call_tool(call.name, args))
 
-    # Execute all queries in parallel
-    results = await asyncio.gather(*tasks)
+    # Execute all queries in parallel with exception handling
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     
     # Build tool response parts
     tool_parts = []
@@ -485,6 +476,9 @@ async def execute_db_tool_node(state: SearchAgentState) -> Dict[str, Any]:
     
     for idx, name in enumerate(call_names):
         result_val = results[idx]
+        if isinstance(result_val, Exception):
+            result_val = f"Error executing tool '{name}': {str(result_val)}"
+            
         tool_parts.append(
             types.Part.from_function_response(
                 name=name,
