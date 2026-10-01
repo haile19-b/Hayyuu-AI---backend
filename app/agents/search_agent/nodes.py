@@ -403,7 +403,7 @@ Synthesized Answer:
 
     try:
         response = genAI.models.generate_content(
-            model="gemini-3.5-flash",
+            model="gemini-3.8-flash",
             contents=history,
             config=types.GenerateContentConfig(
                 tools=gemini_tools,

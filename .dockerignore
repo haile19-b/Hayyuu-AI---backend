@@ -1,0 +1,25 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Git and IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Local data & environment
+.env
+uploads/
+*.log

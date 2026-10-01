@@ -68,7 +68,7 @@ async def run_search_agent(state: SearchAgentState, mcp_manager: Any = None) -> 
     logger.info(f"Running Search Agent checkpointed workflow for thread {thread_id}")
     
     # Initialize connection to PostgreSQL for state checkpoints
-    async with AsyncPostgresSaver.from_conn_string(settings.DATABASE_URL) as checkpointer:
+    async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
         await checkpointer.setup()
         
         # Compile graph with checkpointing

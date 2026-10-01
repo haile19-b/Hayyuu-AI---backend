@@ -32,19 +32,23 @@ async def lifespan(app: FastAPI):
         logger = logging.getLogger("uvicorn.error")
         logger.error(f"⚠️ Could not connect to MCP Servers: {mcp_err}")
 
-    # Start programmatic arq worker inside the FastAPI event loop using async_run
-    from arq.worker import create_worker
-    from app.core.queue import WorkerSettings
-    
-    try:
-        worker = create_worker(WorkerSettings)
-        worker_task = asyncio.create_task(worker.async_run())
-        app.state.worker = worker
-        app.state.worker_task = worker_task
-    except Exception as worker_err:
-        import logging
-        logger = logging.getLogger("uvicorn.error")
-        logger.error(f"⚠️ Could not start arq worker programmatically: {worker_err}. Background worker features disabled.")
+    # Start programmatic arq worker inside the FastAPI event loop if enabled (Method C uses separate worker container)
+    if settings.ENABLE_EMBEDDED_WORKER:
+        from arq.worker import create_worker
+        from app.core.queue import WorkerSettings
+        
+        try:
+            worker = create_worker(WorkerSettings)
+            worker_task = asyncio.create_task(worker.async_run())
+            app.state.worker = worker
+            app.state.worker_task = worker_task
+            import logging
+            logger = logging.getLogger("uvicorn.error")
+            logger.info("ℹ️ Embedded ARQ worker started in web process")
+        except Exception as worker_err:
+            import logging
+            logger = logging.getLogger("uvicorn.error")
+            logger.error(f"⚠️ Could not start arq worker programmatically: {worker_err}. Background worker features disabled.")
 
     yield
     # 2. Shutdown: Disconnect from DB, Redis, and MCP Client sessions

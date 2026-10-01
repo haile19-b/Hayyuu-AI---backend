@@ -31,7 +31,7 @@ async def run_workflow(document_id: str, project_id: str) -> None:
     logger.info(f"Running LangGraph workflow for document {document_id}")
     
     # Initialize connection to PostgreSQL for state checkpoints
-    async with AsyncPostgresSaver.from_conn_string(settings.DATABASE_URL) as checkpointer:
+    async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
         # Create checkpoint tables if they do not exist
         await checkpointer.setup()
         

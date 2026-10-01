@@ -93,7 +93,7 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     # Run API request in thread pool using the Interactions API
     def _generate():
         response = genAI.interactions.create(
-            model="gemini-3.5-flash",
+            model="gemini-3.8-flash",
             input=[
                 {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
                 {"type": "text", "text": prompt}
@@ -265,7 +265,7 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
     
     def _generate():
         response = genAI.interactions.create(
-            model="gemini-3.5-flash",
+            model="gemini-3.8-flash",
             input=[
                 {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
                 {"type": "text", "text": prompt}
