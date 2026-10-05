@@ -5,6 +5,7 @@ from io import BytesIO
 from google import genai
 
 from app.agents.requirements_extractor.schema import ExtractionResponse, SuggestionsResponse
+from app.agents.requirements_extractor.tools import call_gemini_with_fallback
 from app.core.database import prisma
 from prisma import Json
 from app.core.storage import storage_utility
@@ -66,9 +67,10 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     existing_reqs = await prisma.requirement.find_many(where={"projectId": proj_id})
     existing_reqs_text = ""
     if existing_reqs:
-        existing_reqs_text = "Here is the list of existing requirements in the database for this project:\n"
+        existing_reqs_text = "Here is a summary of existing requirements in the project (use for EXISTING_VS_NEW conflicts):\n"
         for r in existing_reqs:
-            existing_reqs_text += f"Database UUID: {r.id}\nTitle: {r.title}\nDescription: {r.description}\n---\n"
+            desc_preview = (r.description[:120] + "...") if len(r.description) > 120 else r.description
+            existing_reqs_text += f"- [UUID: {r.id}] {r.title}: {desc_preview}\n"
     else:
         existing_reqs_text = "There are no existing requirements in the database for this project."
         
@@ -81,26 +83,23 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
         "For these conflicts, classify them as 'EXISTING_VS_NEW' and reference the database UUID of the existing requirement.\n"
         "4. Detect contradictions or inconsistencies among the newly extracted requirements within the uploaded document itself. "
         "For these conflicts, classify them as 'NEW_VS_NEW' and reference the temporary IDs of both requirements in conflict.\n\n"
+        "Guidelines: Keep requirement and task descriptions actionable, technical, concise (1-2 sentences each), and avoid fluff.\n\n"
         f"{existing_reqs_text}\n\n"
         "Return a structured JSON response matching the extraction schema."
     )
     
     await publish_progress(doc_id, "Extracting requirements, tasks, and conflicts using Gemini AI...", "extract_requirements")
     
-    # Run async API request using the Interactions API
-    response = await genAI.aio.interactions.create(
-        model="gemini-3.8-flash",
-        input=[
+    # Run resilient API request with model fallback cascade and exponential backoff
+    response_text = await call_gemini_with_fallback(
+        input_contents=[
             {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
             {"type": "text", "text": prompt}
         ],
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": ExtractionResponse.model_json_schema()
-        }
+        response_schema=ExtractionResponse,
+        doc_id=doc_id,
+        step_name="extract_requirements"
     )
-    response_text = response.output_text
     
     try:
         data = json.loads(response_text)
@@ -258,25 +257,26 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     prompt = (
         "You are an experienced product manager. Analyze the provided project document "
-        "and identify any product gaps, missing requirements, or improvements that should be made "
+        "and identify key product gaps, missing requirements, or improvements that should be made "
         "to ensure project success.\n\n"
-        "Generate a list of actionable suggestions. For each suggestion, provide a title, description, "
-        "reasoning (why it is a gap/improvement), and the suggested category (e.g., 'security', 'usability', 'performance')."
+        "Generate a concise list of actionable suggestions (max 5-7 key suggestions). "
+        "For each suggestion, provide a title, concise description (1-2 sentences), "
+        "reasoning (why it is a gap/improvement), and category ('security', 'usability', 'performance', 'scalability', or 'other')."
     )
     
-    response = await genAI.aio.interactions.create(
-        model="gemini-3.8-flash",
-        input=[
+    # Micro-stagger to avoid simultaneous burst collision with parallel extract_requirements node
+    await asyncio.sleep(0.5)
+    
+    # Run resilient API request with model fallback cascade and exponential backoff
+    response_text = await call_gemini_with_fallback(
+        input_contents=[
             {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
             {"type": "text", "text": prompt}
         ],
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": SuggestionsResponse.model_json_schema()
-        }
+        response_schema=SuggestionsResponse,
+        doc_id=doc_id,
+        step_name="generate_suggestions"
     )
-    response_text = response.output_text
     
     try:
         data = json.loads(response_text)
