@@ -39,8 +39,6 @@ async def disconnect_redis() -> None:
         redis_pool = None
         logger.info("🛑 Redis Pool Disconnected Successfully")
 
-from app.agents.requirements_extractor.graph import run_workflow
-
 async def enqueue_document_analysis(document_id: str, project_id: str) -> None:
     """Enqueue a document analysis background job."""
     global redis_pool
@@ -58,10 +56,11 @@ async def enqueue_document_analysis(document_id: str, project_id: str) -> None:
 
 from prisma.enums import DocumentStatus
 from app.core.database import prisma
-from app.core.progress import publish_progress
 
 async def analyze_document_job(ctx, document_id: str, project_id: str) -> None:
     """The ARQ background task that runs the document analysis pipeline."""
+    from app.agents.requirements_extractor.graph import run_workflow
+    from app.core.progress import publish_progress
     logger.info(f"Starting background job: analyze_document_job for doc={document_id}, proj={project_id}")
     try:
         await run_workflow(document_id, project_id)

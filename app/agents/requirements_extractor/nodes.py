@@ -1,7 +1,6 @@
 import logging
 import json
-import os
-import anyio
+import asyncio
 from io import BytesIO
 from google import genai
 
@@ -36,14 +35,12 @@ async def ingest_document_node(state: DocumentAnalysisState) -> dict:
     await publish_progress(doc_id, f"Downloading file '{document.name}' from storage...", "ingest_document")
     file_bytes = await storage_utility.download_file(document.filePath)
     
-    # 3. Upload file to Gemini Files API for native multi-page document understanding
+    # 3. Upload file directly to Gemini Files API in-memory (no local disk writes)
     await publish_progress(doc_id, "Uploading document to Gemini Files API...", "ingest_document")
-    def _upload():
-        return genAI.files.upload(
-            file=BytesIO(file_bytes),
-            config=dict(mime_type=document.fileType)
-        )
-    gemini_file = await anyio.to_thread.run_sync(_upload)
+    gemini_file = await genAI.aio.files.upload(
+        file=BytesIO(file_bytes),
+        config=dict(mime_type=document.fileType)
+    )
     logger.info(f"Successfully uploaded document to Gemini. URI: {gemini_file.uri}")
     await publish_progress(doc_id, "Document successfully uploaded to Gemini.", "ingest_document")
     
@@ -90,23 +87,20 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     
     await publish_progress(doc_id, "Extracting requirements, tasks, and conflicts using Gemini AI...", "extract_requirements")
     
-    # Run API request in thread pool using the Interactions API
-    def _generate():
-        response = genAI.interactions.create(
-            model="gemini-3.8-flash",
-            input=[
-                {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
-                {"type": "text", "text": prompt}
-            ],
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": ExtractionResponse.model_json_schema()
-            }
-        )
-        return response.output_text
-        
-    response_text = await anyio.to_thread.run_sync(_generate)
+    # Run async API request using the Interactions API
+    response = await genAI.aio.interactions.create(
+        model="gemini-3.8-flash",
+        input=[
+            {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
+            {"type": "text", "text": prompt}
+        ],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": ExtractionResponse.model_json_schema()
+        }
+    )
+    response_text = response.output_text
     
     try:
         data = json.loads(response_text)
@@ -151,26 +145,31 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
         req_created_ids.append(db_req.id)
         req_created += 1
         
-        # Create associated developer tasks (as PENDING approval status)
+        # Concurrently create associated developer tasks for this requirement
+        task_coroutines = []
         for t in req.get("tasks", []):
             t_priority_str = t.get("priority", "P2").upper()
             t_priority = TaskPriority.P2
             if t_priority_str in ["P0", "P1", "P2"]:
                 t_priority = TaskPriority[t_priority_str]
                 
-            await prisma.task.create(
-                data={
-                    "projectId": proj_id,
-                    "requirementId": db_req.id,
-                    "title": t["title"],
-                    "description": t["description"],
-                    "priority": t_priority,
-                    "status": TaskStatus.TODO,
-                    "source": TaskSource.SYSTEM,
-                    "approvalStatus": TaskApprovalStatus.PENDING
-                }
+            task_coroutines.append(
+                prisma.task.create(
+                    data={
+                        "projectId": proj_id,
+                        "requirementId": db_req.id,
+                        "title": t["title"],
+                        "description": t["description"],
+                        "priority": t_priority,
+                        "status": TaskStatus.TODO,
+                        "source": TaskSource.SYSTEM,
+                        "approvalStatus": TaskApprovalStatus.PENDING
+                    }
+                )
             )
-            task_created += 1
+        if task_coroutines:
+            await asyncio.gather(*task_coroutines)
+            task_created += len(task_coroutines)
             
     # Save Conflicts
     conflicts_created = 0
@@ -226,9 +225,11 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
                     }
                 )
                 
-                # Flag both requirements as conflicted
-                await prisma.requirement.update(where={"id": req_a_id}, data={"isConflicted": True})
-                await prisma.requirement.update(where={"id": req_b_id}, data={"isConflicted": True})
+                # Flag both requirements as conflicted concurrently
+                await asyncio.gather(
+                    prisma.requirement.update(where={"id": req_a_id}, data={"isConflicted": True}),
+                    prisma.requirement.update(where={"id": req_b_id}, data={"isConflicted": True})
+                )
                 conflicts_created += 1
                 
     await publish_progress(
@@ -263,22 +264,19 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         "reasoning (why it is a gap/improvement), and the suggested category (e.g., 'security', 'usability', 'performance')."
     )
     
-    def _generate():
-        response = genAI.interactions.create(
-            model="gemini-3.8-flash",
-            input=[
-                {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
-                {"type": "text", "text": prompt}
-            ],
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": SuggestionsResponse.model_json_schema()
-            }
-        )
-        return response.output_text
-        
-    response_text = await anyio.to_thread.run_sync(_generate)
+    response = await genAI.aio.interactions.create(
+        model="gemini-3.8-flash",
+        input=[
+            {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
+            {"type": "text", "text": prompt}
+        ],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": SuggestionsResponse.model_json_schema()
+        }
+    )
+    response_text = response.output_text
     
     try:
         data = json.loads(response_text)
@@ -293,9 +291,8 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     await publish_progress(doc_id, f"Saving {len(suggestions)} AI suggestions to the database...", "generate_suggestions")
     
-    created_count = 0
-    for sug in suggestions:
-        await prisma.aisuggestion.create(
+    suggestion_coroutines = [
+        prisma.aisuggestion.create(
             data={
                 "projectId": proj_id,
                 "type": "gap_analysis",
@@ -308,7 +305,10 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
                 "status": SuggestionStatus.PENDING
             }
         )
-        created_count += 1
+        for sug in suggestions
+    ]
+    await asyncio.gather(*suggestion_coroutines)
+    created_count = len(suggestion_coroutines)
         
     await publish_progress(doc_id, f"Gap analysis complete. Saved {created_count} gap improvement suggestions.", "generate_suggestions")
     logger.info(f"Saved {created_count} AISuggestions to the database.")

@@ -1,3 +1,4 @@
+import os
 import anyio
 import boto3
 from botocore.config import Config
@@ -39,6 +40,9 @@ class StorageUtility:
         )
 
     def _download_file_sync(self, file_path: str) -> bytes:
+        if os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                return f.read()
         response = self.s3_client.get_object(
             Bucket=self.bucket_name,
             Key=file_path,
