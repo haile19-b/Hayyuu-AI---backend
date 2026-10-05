@@ -11,6 +11,12 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hayyuu_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
@@ -18,6 +24,12 @@ services:
     ports:
       - "6379:6379"
     restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
 
   neo4j:
     image: neo4j:5.18-community
@@ -30,6 +42,59 @@ services:
     volumes:
       - neo4j_data:/data
     restart: always
+
+  # Method C: FastAPI Web API Container
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hayyuu_web
+    command: uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Network overrides for containerized communication
+      REDIS_URL: redis://redis:6379/0
+      ENABLE_EMBEDDED_WORKER: "false" # Dedicated worker container handles tasks
+      NEO4J_URI: bolt://neo4j:7687
+      # Uncomment below to connect directly to the local postgres container instead of Neon:
+      # DATABASE_URL: postgresql://postgres:password@postgres:5432/hayyuu_db
+    volumes:
+      - .:/app # Hot reloading mount for source code
+      - /app/.venv # Anonymous volume preserving container's Linux virtualenv
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Method C: Background Task ARQ Worker Container
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Note: Omit fixed container_name to allow horizontal scaling via --scale worker=N
+    command: uv run arq app.core.queue.WorkerSettings
+    env_file:
+      - .env
+    environment:
+      # Network overrides for containerized communication
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+      # Uncomment below to connect directly to the local postgres container instead of Neon:
+      # DATABASE_URL: postgresql://postgres:password@postgres:5432/hayyuu_db
+    volumes:
+      - .:/app # Code changes propagate to workers during dev
+      - /app/.venv # Anonymous volume preserving container's Linux virtualenv
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:

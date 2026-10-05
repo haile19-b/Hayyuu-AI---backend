@@ -15,7 +15,7 @@ from app.agents.requirements_extractor.nodes import (
 
 logger = logging.getLogger("uvicorn.error")
 
-# Build Graph
+# Build Graph with parallel execution for independent analysis tasks
 builder = StateGraph(DocumentAnalysisState)
 builder.add_node("ingest_document", ingest_document_node)
 builder.add_node("extract_requirements", extract_requirements_node)
@@ -23,7 +23,8 @@ builder.add_node("generate_suggestions", generate_suggestions_node)
 
 builder.add_edge(START, "ingest_document")
 builder.add_edge("ingest_document", "extract_requirements")
-builder.add_edge("extract_requirements", "generate_suggestions")
+builder.add_edge("ingest_document", "generate_suggestions")
+builder.add_edge("extract_requirements", END)
 builder.add_edge("generate_suggestions", END)
 
 async def run_workflow(document_id: str, project_id: str) -> None:
@@ -31,7 +32,7 @@ async def run_workflow(document_id: str, project_id: str) -> None:
     logger.info(f"Running LangGraph workflow for document {document_id}")
     
     # Initialize connection to PostgreSQL for state checkpoints
-    async with AsyncPostgresSaver.from_conn_string(settings.DATABASE_URL) as checkpointer:
+    async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
         # Create checkpoint tables if they do not exist
         await checkpointer.setup()
         

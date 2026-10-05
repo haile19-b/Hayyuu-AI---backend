@@ -147,7 +147,7 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         if state.gemini_file_uri and state.gemini_file_mime_type:
             logger.info(f"[Node: extract_graph] Running extraction using Gemini File URI: {state.gemini_file_uri}")
             response = genAI.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-3.8-flash",
                 contents=[
                     types.Part.from_uri(file_uri=state.gemini_file_uri, mime_type=state.gemini_file_mime_type),
                     prompt
@@ -161,7 +161,7 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         else:
             logger.info("[Node: extract_graph] Running extraction using raw text input...")
             response = genAI.models.generate_content(
-                model="gemini-3.6-flash",
+                model="gemini-3.8-flash",
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",

@@ -1,11 +1,11 @@
 import logging
 import json
-import os
-import anyio
+import asyncio
 from io import BytesIO
 from google import genai
 
 from app.agents.requirements_extractor.schema import ExtractionResponse, SuggestionsResponse
+from app.agents.requirements_extractor.tools import call_gemini_with_fallback
 from app.core.database import prisma
 from prisma import Json
 from app.core.storage import storage_utility
@@ -36,14 +36,12 @@ async def ingest_document_node(state: DocumentAnalysisState) -> dict:
     await publish_progress(doc_id, f"Downloading file '{document.name}' from storage...", "ingest_document")
     file_bytes = await storage_utility.download_file(document.filePath)
     
-    # 3. Upload file to Gemini Files API for native multi-page document understanding
+    # 3. Upload file directly to Gemini Files API in-memory (no local disk writes)
     await publish_progress(doc_id, "Uploading document to Gemini Files API...", "ingest_document")
-    def _upload():
-        return genAI.files.upload(
-            file=BytesIO(file_bytes),
-            config=dict(mime_type=document.fileType)
-        )
-    gemini_file = await anyio.to_thread.run_sync(_upload)
+    gemini_file = await genAI.aio.files.upload(
+        file=BytesIO(file_bytes),
+        config=dict(mime_type=document.fileType)
+    )
     logger.info(f"Successfully uploaded document to Gemini. URI: {gemini_file.uri}")
     await publish_progress(doc_id, "Document successfully uploaded to Gemini.", "ingest_document")
     
@@ -69,9 +67,10 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     existing_reqs = await prisma.requirement.find_many(where={"projectId": proj_id})
     existing_reqs_text = ""
     if existing_reqs:
-        existing_reqs_text = "Here is the list of existing requirements in the database for this project:\n"
+        existing_reqs_text = "Here is a summary of existing requirements in the project (use for EXISTING_VS_NEW conflicts):\n"
         for r in existing_reqs:
-            existing_reqs_text += f"Database UUID: {r.id}\nTitle: {r.title}\nDescription: {r.description}\n---\n"
+            desc_preview = (r.description[:120] + "...") if len(r.description) > 120 else r.description
+            existing_reqs_text += f"- [UUID: {r.id}] {r.title}: {desc_preview}\n"
     else:
         existing_reqs_text = "There are no existing requirements in the database for this project."
         
@@ -84,29 +83,23 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
         "For these conflicts, classify them as 'EXISTING_VS_NEW' and reference the database UUID of the existing requirement.\n"
         "4. Detect contradictions or inconsistencies among the newly extracted requirements within the uploaded document itself. "
         "For these conflicts, classify them as 'NEW_VS_NEW' and reference the temporary IDs of both requirements in conflict.\n\n"
+        "Guidelines: Keep requirement and task descriptions actionable, technical, concise (1-2 sentences each), and avoid fluff.\n\n"
         f"{existing_reqs_text}\n\n"
         "Return a structured JSON response matching the extraction schema."
     )
     
     await publish_progress(doc_id, "Extracting requirements, tasks, and conflicts using Gemini AI...", "extract_requirements")
     
-    # Run API request in thread pool using the Interactions API
-    def _generate():
-        response = genAI.interactions.create(
-            model="gemini-3.5-flash",
-            input=[
-                {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
-                {"type": "text", "text": prompt}
-            ],
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": ExtractionResponse.model_json_schema()
-            }
-        )
-        return response.output_text
-        
-    response_text = await anyio.to_thread.run_sync(_generate)
+    # Run resilient API request with model fallback cascade and exponential backoff
+    response_text = await call_gemini_with_fallback(
+        input_contents=[
+            {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
+            {"type": "text", "text": prompt}
+        ],
+        response_schema=ExtractionResponse,
+        doc_id=doc_id,
+        step_name="extract_requirements"
+    )
     
     try:
         data = json.loads(response_text)
@@ -151,26 +144,31 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
         req_created_ids.append(db_req.id)
         req_created += 1
         
-        # Create associated developer tasks (as PENDING approval status)
+        # Concurrently create associated developer tasks for this requirement
+        task_coroutines = []
         for t in req.get("tasks", []):
             t_priority_str = t.get("priority", "P2").upper()
             t_priority = TaskPriority.P2
             if t_priority_str in ["P0", "P1", "P2"]:
                 t_priority = TaskPriority[t_priority_str]
                 
-            await prisma.task.create(
-                data={
-                    "projectId": proj_id,
-                    "requirementId": db_req.id,
-                    "title": t["title"],
-                    "description": t["description"],
-                    "priority": t_priority,
-                    "status": TaskStatus.TODO,
-                    "source": TaskSource.SYSTEM,
-                    "approvalStatus": TaskApprovalStatus.PENDING
-                }
+            task_coroutines.append(
+                prisma.task.create(
+                    data={
+                        "projectId": proj_id,
+                        "requirementId": db_req.id,
+                        "title": t["title"],
+                        "description": t["description"],
+                        "priority": t_priority,
+                        "status": TaskStatus.TODO,
+                        "source": TaskSource.SYSTEM,
+                        "approvalStatus": TaskApprovalStatus.PENDING
+                    }
+                )
             )
-            task_created += 1
+        if task_coroutines:
+            await asyncio.gather(*task_coroutines)
+            task_created += len(task_coroutines)
             
     # Save Conflicts
     conflicts_created = 0
@@ -226,9 +224,11 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
                     }
                 )
                 
-                # Flag both requirements as conflicted
-                await prisma.requirement.update(where={"id": req_a_id}, data={"isConflicted": True})
-                await prisma.requirement.update(where={"id": req_b_id}, data={"isConflicted": True})
+                # Flag both requirements as conflicted concurrently
+                await asyncio.gather(
+                    prisma.requirement.update(where={"id": req_a_id}, data={"isConflicted": True}),
+                    prisma.requirement.update(where={"id": req_b_id}, data={"isConflicted": True})
+                )
                 conflicts_created += 1
                 
     await publish_progress(
@@ -257,28 +257,26 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     prompt = (
         "You are an experienced product manager. Analyze the provided project document "
-        "and identify any product gaps, missing requirements, or improvements that should be made "
+        "and identify key product gaps, missing requirements, or improvements that should be made "
         "to ensure project success.\n\n"
-        "Generate a list of actionable suggestions. For each suggestion, provide a title, description, "
-        "reasoning (why it is a gap/improvement), and the suggested category (e.g., 'security', 'usability', 'performance')."
+        "Generate a concise list of actionable suggestions (max 5-7 key suggestions). "
+        "For each suggestion, provide a title, concise description (1-2 sentences), "
+        "reasoning (why it is a gap/improvement), and category ('security', 'usability', 'performance', 'scalability', or 'other')."
     )
     
-    def _generate():
-        response = genAI.interactions.create(
-            model="gemini-3.5-flash",
-            input=[
-                {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
-                {"type": "text", "text": prompt}
-            ],
-            response_format={
-                "type": "text",
-                "mime_type": "application/json",
-                "schema": SuggestionsResponse.model_json_schema()
-            }
-        )
-        return response.output_text
-        
-    response_text = await anyio.to_thread.run_sync(_generate)
+    # Micro-stagger to avoid simultaneous burst collision with parallel extract_requirements node
+    await asyncio.sleep(0.5)
+    
+    # Run resilient API request with model fallback cascade and exponential backoff
+    response_text = await call_gemini_with_fallback(
+        input_contents=[
+            {"type": "document", "uri": file_uri, "mime_type": file_mime_type},
+            {"type": "text", "text": prompt}
+        ],
+        response_schema=SuggestionsResponse,
+        doc_id=doc_id,
+        step_name="generate_suggestions"
+    )
     
     try:
         data = json.loads(response_text)
@@ -293,9 +291,8 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     await publish_progress(doc_id, f"Saving {len(suggestions)} AI suggestions to the database...", "generate_suggestions")
     
-    created_count = 0
-    for sug in suggestions:
-        await prisma.aisuggestion.create(
+    suggestion_coroutines = [
+        prisma.aisuggestion.create(
             data={
                 "projectId": proj_id,
                 "type": "gap_analysis",
@@ -308,7 +305,10 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
                 "status": SuggestionStatus.PENDING
             }
         )
-        created_count += 1
+        for sug in suggestions
+    ]
+    await asyncio.gather(*suggestion_coroutines)
+    created_count = len(suggestion_coroutines)
         
     await publish_progress(doc_id, f"Gap analysis complete. Saved {created_count} gap improvement suggestions.", "generate_suggestions")
     logger.info(f"Saved {created_count} AISuggestions to the database.")

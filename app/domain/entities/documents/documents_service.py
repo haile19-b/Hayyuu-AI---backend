@@ -20,11 +20,14 @@ class DocumentsService:
             if not project_res.get("success"):
                 return project_res
 
-            # 2. Upload file to R2 / S3
+            # 2. Upload file directly to S3 / Cloudflare R2
             unique_id = uuid.uuid4().hex
             file_path = f"projects/{project_id}/documents/{unique_id}_{file_name}"
             
-            await storage_utility.upload_file(file_content, file_path, content_type)
+            try:
+                await storage_utility.upload_file(file_content, file_path, content_type)
+            except Exception as s3_err:
+                 return {"success": False, "error": f"Cloud storage upload failed: {str(s3_err)}"}
 
             # 3. Save document record in the database
             document = await prisma.document.create(

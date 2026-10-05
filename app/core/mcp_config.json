@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "db-graph": {
+      "command": "uv",
+      "args": ["run", "python", "-m", "app.infrastructure.mcp.db_graph_server"]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["--with", "mcp<2", "mcp-server-fetch"]
+    }
+  }
+}

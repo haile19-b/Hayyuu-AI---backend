@@ -61,19 +61,24 @@ workflow.add_conditional_edges(
 search_agent_graph = workflow.compile()
 
 
-async def run_search_agent(state: SearchAgentState) -> Dict[str, Any]:
+async def run_search_agent(state: SearchAgentState, mcp_manager: Any = None) -> Dict[str, Any]:
     """Runs the Search Agent with persistent Postgres state checkpointing."""
     run_id = str(uuid.uuid4())
     thread_id = f"{state.project_id}-search-{run_id}"
     logger.info(f"Running Search Agent checkpointed workflow for thread {thread_id}")
     
     # Initialize connection to PostgreSQL for state checkpoints
-    async with AsyncPostgresSaver.from_conn_string(settings.DATABASE_URL) as checkpointer:
+    async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
         await checkpointer.setup()
         
         # Compile graph with checkpointing
         graph = workflow.compile(checkpointer=checkpointer)
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {
+            "configurable": {
+                "thread_id": thread_id,
+                "mcp_manager": mcp_manager
+            }
+        }
         
         # Start execution
         result_state = await graph.ainvoke(state.model_dump(), config=config)

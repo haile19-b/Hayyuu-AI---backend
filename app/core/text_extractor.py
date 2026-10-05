@@ -81,7 +81,7 @@ async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
         
         def _generate():
             response = genAI.models.generate_content(
-                model="gemini-3.5-flash",
+                model="gemini-3.8-flash",
                 contents=[binary_part, prompt]
             )
             return response.text

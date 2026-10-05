@@ -46,7 +46,7 @@ async def run_knowledge_builder(state: KnowledgeBuilderState) -> None:
     logger.info(f"Running Knowledge Builder checkpointed workflow for thread {thread_id}")
     
     # Initialize persistent state checkpointer
-    async with AsyncPostgresSaver.from_conn_string(settings.DATABASE_URL) as checkpointer:
+    async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
         await checkpointer.setup()
         
         # Compile graph with saver checkpointer
