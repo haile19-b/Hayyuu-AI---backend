@@ -43,6 +43,22 @@ async def disconnect_db() -> None:
         except Exception as e:
             logger.error(f"❌ Error during database disconnection: {e}")
 
+async def ensure_db_connected() -> None:
+    """Ensures database connection is active, reconnecting if disconnected or stale."""
+    try:
+        if not prisma.is_connected():
+            await connect_db()
+        else:
+            # Lightweight ping to verify socket health
+            await prisma.query_raw("SELECT 1")
+    except Exception as e:
+        logger.warning(f"Database connection health check failed ({e}). Reconnecting...")
+        try:
+            await prisma.disconnect()
+        except Exception:
+            pass
+        await connect_db()
+
 # FastAPI Dependency Injection
 async def get_db() -> AsyncGenerator[Prisma, None]:
     """

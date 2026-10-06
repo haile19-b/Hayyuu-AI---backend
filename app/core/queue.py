@@ -68,13 +68,19 @@ async def analyze_document_job(ctx, document_id: str, project_id: str) -> None:
     except Exception as e:
         logger.error(f"Failed background job: analyze_document_job for doc={document_id}. Error: {e}")
         try:
+            from app.core.database import ensure_db_connected
+            await ensure_db_connected()
             await prisma.document.update(
                 where={"id": document_id},
                 data={"status": DocumentStatus.FAILED}
             )
-            await publish_progress(document_id, f"Analysis failed: {str(e)}", "error", "FAILED")
         except Exception as db_err:
             logger.error(f"Failed to update document status to FAILED in DB: {db_err}")
+            
+        try:
+            await publish_progress(document_id, f"Analysis failed: {str(e)}", "error", "FAILED")
+        except Exception as pub_err:
+            logger.error(f"Failed to publish failure progress: {pub_err}")
         raise e
 
 async def startup(ctx) -> None:
