@@ -11,20 +11,44 @@ from app.core.config import genAI
 
 logger = logging.getLogger("uvicorn.error")
 
-# Configure accurate table parsing options for IBM Docling
+import os
+from typing import Tuple, Optional, Any
+
+# Configure high-speed, layout-aware options for IBM Docling
 try:
     from docling.document_converter import DocumentConverter, PdfFormatOption
     from docling.datamodel.base_models import InputFormat, DocumentStream
-    from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+    from docling.datamodel.pipeline_options import (
+        PdfPipelineOptions,
+        TableFormerMode,
+        AcceleratorOptions,
+    )
+    from docling.datamodel.accelerator_options import AcceleratorDevice
     
-    pipeline_options = PdfPipelineOptions(do_table_structure=True)
-    pipeline_options.table_structure_options.mode = TableFormerMode.ACCURATE
+    pipeline_options = PdfPipelineOptions()
+    # 1. Performance: disable CPU OCR on digital PDFs (fallback routes scanned docs to Gemini Vision)
+    pipeline_options.do_ocr = False
+    # 2. Performance: fast table structure mode
+    pipeline_options.do_table_structure = True
+    pipeline_options.table_structure_options.mode = TableFormerMode.FAST
+    # 3. Performance: skip raster page and picture rendering
+    pipeline_options.generate_page_images = False
+    pipeline_options.generate_picture_images = False
+    pipeline_options.generate_table_images = False
+    pipeline_options.images_scale = 1.0
+    # 4. Multi-threading optimization
+    cpu_cores = os.cpu_count() or 4
+    pipeline_options.accelerator_options = AcceleratorOptions(
+        num_threads=min(4, cpu_cores),
+        device=AcceleratorDevice.AUTO
+    )
+    
     doc_converter = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
         }
     )
-    logger.info("✅ IBM Docling DocumentConverter Initialized Successfully")
+    logger.info("✅ High-Speed IBM Docling DocumentConverter Initialized Successfully")
 except Exception as doc_err:
     logger.error(f"Failed to initialize Docling converter: {doc_err}")
     doc_converter = None
@@ -92,6 +116,36 @@ async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
         raise e
 
 
+def extract_docling_document(file_bytes: bytes, content_type: str) -> Tuple[Optional[str], Optional[Any]]:
+    """
+    Synchronously converts document bytes into a DoclingDocument instance using the optimized converter.
+    Returns (markdown_text, docling_doc) if successful, otherwise (None, None).
+    """
+    if not doc_converter:
+        return None, None
+
+    c_type = content_type.lower()
+    is_pdf = "pdf" in c_type or c_type == "application/pdf"
+    is_docx = (
+        "wordprocessingml.document" in c_type
+        or c_type == "docx"
+        or "vnd.openxmlformats-officedocument.wordprocessingml" in c_type
+    )
+
+    if not (is_pdf or is_docx):
+        return None, None
+
+    try:
+        ext = "pdf" if is_pdf else "docx"
+        source = DocumentStream(name=f"document.{ext}", stream=BytesIO(file_bytes))
+        result = doc_converter.convert(source)
+        markdown_text = result.document.export_to_markdown()
+        return markdown_text, result.document
+    except Exception as e:
+        logger.warning(f"Docling conversion failed: {e}")
+        return None, None
+
+
 async def extract_text(file_bytes: bytes, content_type: str) -> str:
     """
     Core entry point to extract text based on mime-type.
@@ -108,16 +162,14 @@ async def extract_text(file_bytes: bytes, content_type: str) -> str:
 
     # 1. Attempt structured extraction via IBM Docling
     if doc_converter and (is_pdf or is_docx):
-        logger.info(f"Attempting layout-aware text extraction for {content_type} via Docling")
+        logger.info(f"Attempting high-speed layout-aware text extraction for {content_type} via Docling")
         try:
             def _convert():
-                ext = "pdf" if "pdf" in content_type.lower() else "docx"
-                source = DocumentStream(name=f"document.{ext}", stream=BytesIO(file_bytes))
-                result = doc_converter.convert(source)
-                return result.document.export_to_markdown()
+                md, _ = extract_docling_document(file_bytes, content_type)
+                return md
             
             markdown_text = await anyio.to_thread.run_sync(_convert)
-            if markdown_text.strip():
+            if markdown_text and markdown_text.strip():
                 logger.info("Successfully extracted text via Docling.")
                 return markdown_text
         except Exception as e:
