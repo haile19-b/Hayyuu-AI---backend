@@ -5,7 +5,7 @@ from io import BytesIO
 from google import genai
 
 from app.agents.requirements_extractor.schema import ExtractionResponse, SuggestionsResponse
-from app.agents.requirements_extractor.tools import call_gemini_with_fallback
+from app.agents.requirements_extractor.tools import call_gemini_with_fallback, clean_json_response
 from app.core.database import prisma
 from prisma import Json
 from app.core.storage import storage_utility
@@ -102,11 +102,12 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     )
     
     try:
-        data = json.loads(response_text)
+        clean_text = clean_json_response(response_text)
+        data = json.loads(clean_text)
         reqs = data.get("requirements", [])
         detected_conflicts = data.get("conflicts", [])
     except Exception as e:
-        logger.error(f"Failed to parse JSON response from Gemini: {e}. Raw response: {response_text}")
+        logger.error(f"Failed to parse JSON response from Gemini: {e}. Raw response: {response_text[:300]}")
         raise ValueError(f"Gemini joint extraction returned invalid JSON: {e}")
         
     # Save Requirements & Tasks
@@ -279,10 +280,11 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
     )
     
     try:
-        data = json.loads(response_text)
+        clean_text = clean_json_response(response_text)
+        data = json.loads(clean_text)
         suggestions = data.get("suggestions", [])
     except Exception as e:
-        logger.error(f"Failed to parse suggestions JSON from Gemini: {e}")
+        logger.error(f"Failed to parse suggestions JSON from Gemini: {e}. Raw response: {response_text[:300]}")
         raise ValueError(f"Gemini suggestions extraction returned invalid JSON: {e}")
         
     if not suggestions:

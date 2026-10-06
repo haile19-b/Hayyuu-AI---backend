@@ -11,6 +11,7 @@ from app.core.storage import storage_utility
 from app.core.progress import publish_progress
 from app.core.text_extractor import extract_text, extract_docling_document
 from app.libs.chunker import chunk_document_text
+from app.agents.requirements_extractor.tools import clean_json_response
 from app.infrastructure.ai.gemini_embedder import gemini_embedder
 from app.infrastructure.vector_store.pgvector import pgvector_store
 from app.infrastructure.graph_store.neo4j import neo4j_graph_store
@@ -215,7 +216,8 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                 ),
             )
 
-        raw_graph = ExtractedKnowledgeGraph.model_validate_json(response.text)
+        clean_text = clean_json_response(response.text)
+        raw_graph = ExtractedKnowledgeGraph.model_validate_json(clean_text)
     except Exception as e:
         logger.error(f"Error during graph extraction: {e}")
         if doc_id:
