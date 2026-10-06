@@ -3,11 +3,12 @@ import uuid
 import re
 from typing import Dict, Any, List
 from google.genai import types
+import anyio
 
 from app.core.config import genAI
 from app.core.database import prisma
 from app.core.storage import storage_utility
-from app.core.text_extractor import extract_text
+from app.core.text_extractor import extract_text, extract_docling_document
 from app.libs.chunker import chunk_document_text
 from app.infrastructure.ai.gemini_embedder import gemini_embedder
 from app.infrastructure.vector_store.pgvector import pgvector_store
@@ -43,6 +44,7 @@ async def preprocess_chunk_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     """Downloads files if needed, extracts text, and partitions text into token chunks."""
     raw_text = state.raw_text
     doc_id = state.document_id
+    docling_doc = None
 
     if not raw_text.strip():
         if not doc_id:
@@ -55,14 +57,28 @@ async def preprocess_chunk_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                 return {"errors": state.errors + [f"Document with ID {doc_id} not found."]}
 
             file_bytes = await storage_utility.download_file(document.filePath)
-            raw_text = await extract_text(file_bytes, document.fileType)
+
+            # 1. Attempt single-pass extraction & DoclingDocument generation
+            try:
+                def _extract_doc():
+                    return extract_docling_document(file_bytes, document.fileType)
+
+                raw_text, docling_doc = await anyio.to_thread.run_sync(_extract_doc)
+            except Exception as doc_err:
+                logger.warning(f"Docling extraction failed during preprocessing: {doc_err}")
+                raw_text, docling_doc = None, None
+
+            # 2. Fall back to standard extract_text if Docling didn't extract text
+            if not raw_text or not raw_text.strip():
+                logger.info("Falling back to extract_text extractor")
+                raw_text = await extract_text(file_bytes, document.fileType)
         except Exception as e:
             logger.error(f"Error extracting text during preprocessing: {e}")
             return {"errors": state.errors + [f"Text extraction error: {e}"]}
 
-    # Partition text into chunks
+    # Partition text into chunks (reusing in-memory DoclingDocument if available)
     try:
-        chunks = chunk_document_text(raw_text)
+        chunks = chunk_document_text(raw_text, docling_doc=docling_doc)
         chunk_objects = [
             ChunkData(
                 chunk_index=c["chunk_index"],
