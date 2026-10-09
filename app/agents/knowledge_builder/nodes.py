@@ -48,13 +48,6 @@ async def preprocess_chunk_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     doc_id = state.document_id
     docling_doc = None
 
-    # 0. Check if preprocess stage is already completed in state
-    if "preprocess" in state.completed_stages and state.chunks:
-        logger.info(f"[Node: preprocess_chunk] Document text already preprocessed ({len(state.chunks)} chunks cached). Skipping Docling.")
-        if doc_id:
-            await publish_progress(doc_id, f"Reusing {len(state.chunks)} cached semantic chunks from previous run.", "preprocess")
-        return {"completed_stages": list(set(state.completed_stages + ["preprocess"]))}
-
     if doc_id:
         await publish_progress(doc_id, "Preparing document text and structural layout...", "preprocess")
 
@@ -118,8 +111,7 @@ async def preprocess_chunk_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
             await publish_progress(doc_id, f"Document preprocessing complete. Created {len(chunk_objects)} semantic chunks.", "preprocess")
         return {
             "raw_text": raw_text,
-            "chunks": chunk_objects,
-            "completed_stages": list(set(state.completed_stages + ["preprocess"]))
+            "chunks": chunk_objects
         }
     except Exception as e:
         logger.error(f"Error chunking text: {e}")
@@ -136,13 +128,6 @@ async def generate_embeddings_node(state: KnowledgeBuilderState) -> Dict[str, An
     if not chunks:
         return {}
 
-    # 0. Check if embeddings are already completed
-    if "embed" in state.completed_stages and all(c.embedding is not None for c in chunks):
-        logger.info(f"[Node: generate_embeddings] Embeddings already generated for {len(chunks)} chunks. Skipping.")
-        if doc_id:
-            await publish_progress(doc_id, f"Reusing {len(chunks)} cached vector embeddings.", "embed")
-        return {"completed_stages": list(set(state.completed_stages + ["embed"]))}
-
     try:
         logger.info(f"[Node: generate_embeddings] Generating embeddings for {len(chunks)} chunks...")
         if doc_id:
@@ -155,10 +140,7 @@ async def generate_embeddings_node(state: KnowledgeBuilderState) -> Dict[str, An
 
         if doc_id:
             await publish_progress(doc_id, f"Generated vector embeddings for {len(chunks)} chunks successfully.", "embed")
-        return {
-            "chunks": chunks,
-            "completed_stages": list(set(state.completed_stages + ["embed"]))
-        }
+        return {"chunks": chunks}
     except Exception as e:
         logger.error(f"Failed to generate embeddings: {e}")
         if doc_id:
@@ -174,13 +156,6 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     """
     project_id = state.project_id
     doc_id = state.document_id
-
-    # 0. Check if graph extraction is already completed
-    if "extract" in state.completed_stages and state.extracted_graph.nodes:
-        logger.info(f"[Node: extract_graph] Knowledge graph already extracted ({len(state.extracted_graph.nodes)} nodes). Skipping LLM.")
-        if doc_id:
-            await publish_progress(doc_id, f"Reusing {len(state.extracted_graph.nodes)} cached graph entities from previous run.", "extract")
-        return {"completed_stages": list(set(state.completed_stages + ["extract"]))}
 
     # Segment raw text with chunk index boundaries for source chunk tracking
     chunks_text_list = []
@@ -329,10 +304,7 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
             f"Knowledge graph extraction complete. Identified {len(nodes)} entity nodes and {len(relationships)} relationships.",
             "extract",
         )
-    return {
-        "extracted_graph": processed_graph,
-        "completed_stages": list(set(state.completed_stages + ["extract"]))
-    }
+    return {"extracted_graph": processed_graph}
 
 
 # 4. Store Vectors Node
@@ -340,13 +312,6 @@ async def store_vectors_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     """Persists document chunks and vector embeddings directly into Neo4j."""
     doc_id = state.document_id or "synthesized-doc"
     proj_id = state.project_id
-
-    # 0. Check if store_vectors stage is already completed
-    if "store_vectors" in state.completed_stages:
-        logger.info(f"[Node: store_vectors] Vector chunks already stored in Neo4j. Skipping.")
-        if state.document_id:
-            await publish_progress(state.document_id, "Vector chunks already indexed in Neo4j. Skipping re-storage.", "store_vectors")
-        return {"completed_stages": list(set(state.completed_stages + ["store_vectors"]))}
 
     logger.info(f"[Node: store_vectors] Storing vector chunks for document {doc_id} directly in Neo4j...")
     if state.document_id:
@@ -454,10 +419,7 @@ async def store_vectors_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                 f"Successfully indexed {len(chunk_batch)} vector chunks and structural links in Neo4j.",
                 "store_vectors",
             )
-        return {
-            "total_vectors_stored": len(chunk_batch),
-            "completed_stages": list(set(state.completed_stages + ["store_vectors"]))
-        }
+        return {"total_vectors_stored": len(chunk_batch)}
     except Exception as e:
         logger.error(f"Failed storing chunk vectors in Neo4j: {e}")
         if state.document_id:
@@ -471,13 +433,6 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     graph = state.extracted_graph
     project_id = state.project_id
     doc_id = state.document_id
-
-    # 0. Check if store_graph stage is already completed
-    if "store_graph" in state.completed_stages:
-        logger.info(f"[Node: store_graph] Graph already stored in Neo4j. Skipping.")
-        if doc_id:
-            await publish_progress(doc_id, "Knowledge graph already indexed in Neo4j. Skipping re-storage.", "store_graph")
-        return {"completed_stages": list(set(state.completed_stages + ["store_graph"]))}
 
     if doc_id:
         await publish_progress(
@@ -638,10 +593,7 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
             f"Neo4j graph memory populated with {node_count} nodes and {rel_count} relationships.",
             "store_graph",
         )
-    return {
-        "total_nodes_stored": node_count + rel_count,
-        "completed_stages": list(set(state.completed_stages + ["store_graph"]))
-    }
+    return {"total_nodes_stored": node_count + rel_count}
 
 
 # 6. Save Results Node
@@ -666,7 +618,4 @@ async def save_results_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
             f"Knowledge base indexing complete: {state.total_vectors_stored or 0} vector chunks and {state.total_nodes_stored or 0} graph elements indexed.",
             "save_results",
         )
-    return {
-        "status": "completed",
-        "completed_stages": list(set(state.completed_stages + ["save_results"]))
-    }
+    return {"status": "completed"}
