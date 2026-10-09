@@ -63,9 +63,17 @@ async def run_knowledge_builder(state: KnowledgeBuilderState) -> None:
                 await publish_progress(state.document_id, f"Resuming knowledge base construction from stage '{next_node}'...", "knowledge_builder")
             await graph.ainvoke(None, config=config)
         elif kb_state and not kb_state.next and kb_state.values:
-            logger.info(f"Knowledge Builder already completed for {thread_id}. Skipping.")
-            if state.document_id:
-                await publish_progress(state.document_id, "Knowledge base construction already completed.", "knowledge_builder")
+            status_val = kb_state.values.get("status")
+            has_errors = bool(kb_state.values.get("errors"))
+            if status_val == "completed" and not has_errors:
+                logger.info(f"Knowledge Builder already completed for {thread_id}. Skipping.")
+                if state.document_id:
+                    await publish_progress(state.document_id, "Knowledge base construction already completed.", "knowledge_builder")
+            else:
+                logger.warning(f"Previous Knowledge Builder run for {thread_id} finished in status='{status_val}'. Re-executing...")
+                if state.document_id:
+                    await publish_progress(state.document_id, "Re-running knowledge base construction...", "knowledge_builder")
+                await graph.ainvoke(state.model_dump(), config=config)
         else:
             logger.info(f"Starting fresh Knowledge Builder execution for {thread_id}")
             if state.document_id:
@@ -74,7 +82,10 @@ async def run_knowledge_builder(state: KnowledgeBuilderState) -> None:
 
         # Check final execution result
         final_state = await graph.aget_state(config)
-        if final_state and final_state.values and final_state.values.get("errors"):
-            errors = final_state.values["errors"]
-            logger.error(f"Knowledge builder execution finished with errors: {errors}")
-            raise RuntimeError(f"Knowledge builder failed: {'; '.join(errors)}")
+        if final_state and final_state.values:
+            if final_state.values.get("errors"):
+                errors = final_state.values["errors"]
+                logger.error(f"Knowledge builder execution finished with errors: {errors}")
+                raise RuntimeError(f"Knowledge builder failed: {'; '.join(errors)}")
+            if final_state.values.get("status") == "failed":
+                raise RuntimeError("Knowledge builder execution finished in failed status.")
