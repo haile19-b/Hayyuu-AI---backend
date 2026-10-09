@@ -38,4 +38,3 @@ class KnowledgeBuilderState(BaseModel):
     total_nodes_stored: int = Field(0, description="Count of entities/relations written to Neo4j")
     errors: List[str] = Field(default_factory=list, description="Validation/processing errors encountered")
     status: str = Field("pending", description="Pipeline status: pending, running, completed, failed")
-    completed_stages: List[str] = Field(default_factory=list, description="List of pipeline stages that completed successfully")
