@@ -255,11 +255,11 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     prompt = (
         "You are an experienced product manager. Analyze the provided project document "
-        "and identify key product gaps, missing requirements, or improvements that should be made "
-        "to ensure project success.\n\n"
-        "Generate a concise list of actionable suggestions (max 5-7 key suggestions). "
-        "For each suggestion, provide a title, concise description (1-2 sentences), "
-        "reasoning (why it is a gap/improvement), and category ('security', 'usability', 'performance', 'scalability', or 'other')."
+        "and identify critical product gaps, missing architectural requirements, or improvements.\n\n"
+        "Generate a concise list of 3-5 high-impact suggestions only. "
+        "For each suggestion, provide a short title (max 8 words), a 1-sentence description of the gap/change, "
+        "a 1-sentence reasoning explaining why it is critical, and its category ('security', 'usability', 'performance', 'scalability', or 'other'). "
+        "Keep descriptions concise and avoid narrative preambles."
     )
     
     # Micro-stagger to avoid simultaneous burst collision with parallel extract_requirements node
