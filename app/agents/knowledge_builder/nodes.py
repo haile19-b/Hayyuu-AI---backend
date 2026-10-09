@@ -11,7 +11,7 @@ from app.core.storage import storage_utility
 from app.core.progress import publish_progress
 from app.core.text_extractor import extract_text, extract_docling_document
 from app.libs.chunker import chunk_document_text
-from app.agents.requirements_extractor.tools import clean_json_response
+from app.agents.requirements_extractor.tools import clean_json_response, call_gemini_with_fallback
 from app.infrastructure.ai.gemini_embedder import gemini_embedder
 from app.infrastructure.vector_store.pgvector import pgvector_store
 from app.infrastructure.graph_store.neo4j import neo4j_graph_store
@@ -169,14 +169,14 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         raw_text_with_boundaries = state.raw_text
 
     prompt = f"""
-    You are an expert systems engineering analyst. Your task is to extract all key entities and relationships from the provided context.
+    You are an expert systems engineering analyst. Your task is to extract core architectural entities and relationships from the provided context.
 
     Guidelines:
-    1. Identify all core entities in the document context. Label them appropriately (e.g., 'Requirement', 'Task', 'Conflict', 'Component', 'Actor', etc.).
+    1. Focus on core architectural entities: 'Component', 'Service', 'Actor', 'DataEntity', 'Integration', or 'Requirement'. Avoid extracting granular subtasks or step-by-step developer tasks.
     2. For each entity you extract, identify which chunk index (0-based integer) it belongs to based on the '--- Chunk Index: X ---' markers in the text, and set the `source_chunk_index` property to that index.
-    3. Extract their name, description, and list any other custom attributes (properties) as key-value pairs.
-    4. Identify how they relate to each other. Label relationship types descriptively (e.g. 'OWNS', 'TRACKS', 'CONTAINS', 'IMPLEMENTS', 'CONFLICTS_WITH', 'DEPENDS_ON').
-    5. Connect the entities using their temporary IDs (the 'id' field you assign, such as 'req_1', 'task_login').
+    3. Keep entity descriptions concise (1 sentence). Limit custom properties to at most 2-3 essential technical attributes.
+    4. Identify how they relate to each other. Label relationship types descriptively (e.g. 'DEPENDS_ON', 'INTEGRATES_WITH', 'CONTAINS', 'CALLS', 'IMPLEMENTS').
+    5. Connect the entities using their temporary IDs (the 'id' field you assign, such as 'comp_auth', 'service_db').
     6. Do not include User, Project, or Document nodes directly in the output list; the pipeline will automatically map and attach them.
 
     Context to analyze (segmented by chunk boundaries):
@@ -192,31 +192,23 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         # Check if we should use multimodal file URI or fall back to raw text
         if state.gemini_file_uri and state.gemini_file_mime_type:
             logger.info(f"[Node: extract_graph] Running extraction using Gemini File URI: {state.gemini_file_uri}")
-            response = genAI.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=[
-                    types.Part.from_uri(file_uri=state.gemini_file_uri, mime_type=state.gemini_file_mime_type),
-                    prompt
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ExtractedKnowledgeGraph,
-                    temperature=0.1,
-                ),
-            )
+            input_contents = [
+                {"type": "document", "uri": state.gemini_file_uri, "mime_type": state.gemini_file_mime_type},
+                {"type": "text", "text": prompt}
+            ]
         else:
             logger.info("[Node: extract_graph] Running extraction using raw text input...")
-            response = genAI.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ExtractedKnowledgeGraph,
-                    temperature=0.1,
-                ),
-            )
+            input_contents = [
+                {"type": "text", "text": prompt}
+            ]
 
-        clean_text = clean_json_response(response.text)
+        clean_text = await call_gemini_with_fallback(
+            input_contents=input_contents,
+            response_schema=ExtractedKnowledgeGraph,
+            doc_id=doc_id,
+            step_name="extract_graph",
+            temperature=0.1
+        )
         raw_graph = ExtractedKnowledgeGraph.model_validate_json(clean_text)
     except Exception as e:
         logger.error(f"Error during graph extraction: {e}")
