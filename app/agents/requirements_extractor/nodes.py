@@ -62,6 +62,33 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     if not file_uri:
         raise ValueError("Gemini file URI is missing. Ingestion node must run first.")
         
+    # 0. State & Database Idempotency Check: check if requirements were already extracted for this document
+    if state.get("requirements_completed") and state.get("extracted_requirement_ids"):
+        logger.info(f"[Node: extract_requirements] Requirements already completed in state for {doc_id}. Skipping.")
+        await publish_progress(doc_id, "Requirements already extracted for this document. Reusing existing requirements.", "extract_requirements")
+        return {
+            "requirements_completed": True,
+            "extracted_requirement_ids": state["extracted_requirement_ids"]
+        }
+
+    existing_marker = await prisma.aisuggestion.find_first(
+        where={
+            "projectId": proj_id,
+            "type": "doc_requirements_extracted",
+        }
+    )
+    if existing_marker and isinstance(existing_marker.content, dict) and existing_marker.content.get("documentId") == doc_id:
+        cached_ids = existing_marker.content.get("requirementIds", [])
+        if cached_ids:
+            existing_count = await prisma.requirement.count(where={"id": {"in": cached_ids}})
+            if existing_count > 0:
+                logger.info(f"[Node: extract_requirements] Found {existing_count} previously extracted requirements in DB for doc {doc_id}. Skipping re-extraction.")
+                await publish_progress(doc_id, f"Found {existing_count} previously extracted requirements in database. Reusing existing requirements.", "extract_requirements")
+                return {
+                    "requirements_completed": True,
+                    "extracted_requirement_ids": cached_ids
+                }
+
     # 1. Retrieve existing project requirements from DB to check for conflicts
     await publish_progress(doc_id, "Checking existing project requirements for conflicts...", "extract_requirements")
     existing_reqs = await prisma.requirement.find_many(where={"projectId": proj_id})
@@ -234,9 +261,24 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
         message=f"Joint processing complete. Saved {req_created} requirements, {task_created} tasks, and flagged {conflicts_created} conflicts.",
         step="extract_requirements"
     )
+    # Save a tracking marker in DB to guarantee idempotency across retries
+    if req_created_ids:
+        await prisma.aisuggestion.create(
+            data={
+                "projectId": proj_id,
+                "type": "doc_requirements_extracted",
+                "content": Json({
+                    "documentId": doc_id,
+                    "requirementIds": req_created_ids
+                }),
+                "status": SuggestionStatus.ACCEPTED
+            }
+        )
+
     logger.info(f"Saved {req_created} requirements, {task_created} tasks, and {conflicts_created} conflicts in DB")
     
     return {
+        "requirements_completed": True,
         "extracted_requirement_ids": req_created_ids
     }
 
@@ -248,6 +290,31 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
     file_mime_type = state.get("gemini_file_mime_type")
     
     logger.info(f"[Node: generate_suggestions] Extracting product gap suggestions for document {doc_id}")
+    
+    # 0. State & Database Idempotency Check: check if suggestions were already generated for this document
+    if state.get("suggestions_completed"):
+        logger.info(f"[Node: generate_suggestions] Suggestions already completed in state for doc {doc_id}. Skipping.")
+        await publish_progress(doc_id, "Suggestions already generated for this document. Reusing existing suggestions.", "generate_suggestions")
+        return {
+            "suggestions_completed": True,
+            "suggestions_count": state.get("suggestions_count", 0)
+        }
+
+    existing_suggestions = await prisma.aisuggestion.find_many(
+        where={"projectId": proj_id, "type": "gap_analysis"}
+    )
+    doc_suggestions = [
+        s for s in existing_suggestions
+        if isinstance(s.content, dict) and s.content.get("documentId") == doc_id
+    ]
+    if doc_suggestions:
+        logger.info(f"[Node: generate_suggestions] Found {len(doc_suggestions)} existing suggestions in DB for doc {doc_id}. Skipping re-extraction.")
+        await publish_progress(doc_id, f"Found {len(doc_suggestions)} previously generated suggestions in database. Reusing existing suggestions.", "generate_suggestions")
+        return {
+            "suggestions_completed": True,
+            "suggestions_count": len(doc_suggestions)
+        }
+
     await publish_progress(doc_id, "Analyzing document for product gaps and improvements...", "generate_suggestions")
     
     if not file_uri:
@@ -286,7 +353,10 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     if not suggestions:
         await publish_progress(doc_id, "No suggestions or product gaps detected.", "generate_suggestions")
-        return {}
+        return {
+            "suggestions_completed": True,
+            "suggestions_count": 0
+        }
         
     await publish_progress(doc_id, f"Saving {len(suggestions)} AI suggestions to the database...", "generate_suggestions")
     
@@ -296,6 +366,7 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
                 "projectId": proj_id,
                 "type": "gap_analysis",
                 "content": Json({
+                    "documentId": doc_id,
                     "title": sug["title"],
                     "description": sug["description"],
                     "reasoning": sug["reasoning"],
@@ -311,4 +382,7 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     await publish_progress(doc_id, f"Gap analysis complete. Saved {created_count} gap improvement suggestions.", "generate_suggestions")
     logger.info(f"Saved {created_count} AISuggestions to the database.")
-    return {}
+    return {
+        "suggestions_completed": True,
+        "suggestions_count": created_count
+    }

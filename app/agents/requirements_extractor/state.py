@@ -7,3 +7,6 @@ class DocumentAnalysisState(TypedDict):
     gemini_file_uri: Optional[str]
     gemini_file_mime_type: Optional[str]
     extracted_requirement_ids: Optional[List[str]]
+    requirements_completed: Optional[bool]
+    suggestions_completed: Optional[bool]
+    suggestions_count: Optional[int]
