@@ -67,23 +67,20 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     existing_reqs = await prisma.requirement.find_many(where={"projectId": proj_id})
     existing_reqs_text = ""
     if existing_reqs:
-        existing_reqs_text = "Here is a summary of existing requirements in the project (use for EXISTING_VS_NEW conflicts):\n"
-        for r in existing_reqs:
-            desc_preview = (r.description[:120] + "...") if len(r.description) > 120 else r.description
-            existing_reqs_text += f"- [UUID: {r.id}] {r.title}: {desc_preview}\n"
+        # Scope to 30 most recent existing requirements to avoid excessive prompt token overhead
+        scoped_reqs = existing_reqs[-30:] if len(existing_reqs) > 30 else existing_reqs
+        existing_reqs_text = "Summary of existing project requirements (use for EXISTING_VS_NEW conflicts):\n"
+        for r in scoped_reqs:
+            existing_reqs_text += f"- [{r.id}] {r.title} ({r.type}, {r.priority})\n"
     else:
-        existing_reqs_text = "There are no existing requirements in the database for this project."
+        existing_reqs_text = "No existing requirements in database for this project."
         
     prompt = (
         "You are an expert systems analyst. Analyze the provided document and perform four tasks:\n"
-        "1. Extract all functional and non-functional software requirements mentioned in it. Assign each a unique temporary ID (e.g., 'new_req_1', 'new_req_2').\n"
-        "2. For each requirement, automatically generate associated specific developer tasks needed to implement that requirement.\n"
-        "3. Compare the document against the list of existing requirements in the database (provided below) "
-        "and identify any conflicts, contradictions, or duplicate requirements between the document and the existing requirements. "
-        "For these conflicts, classify them as 'EXISTING_VS_NEW' and reference the database UUID of the existing requirement.\n"
-        "4. Detect contradictions or inconsistencies among the newly extracted requirements within the uploaded document itself. "
-        "For these conflicts, classify them as 'NEW_VS_NEW' and reference the temporary IDs of both requirements in conflict.\n\n"
-        "Guidelines: Keep requirement and task descriptions actionable, technical, concise (1-2 sentences each), and avoid fluff.\n\n"
+        "1. Extract the core functional and non-functional software requirements (target 10-15 key requirements; consolidate related minor items; avoid trivial UI styling or standard defaults). Assign each a unique temporary ID (e.g., 'new_req_1', 'new_req_2').\n"
+        "2. For each requirement, generate 1-2 short, general milestone tasks needed to implement it (e.g., 'Implement Auth API'). Do NOT generate granular subtasks, step-by-step developer checklists, or unit test suites. Keep task titles short (max 8 words) and descriptions to 1 concise sentence.\n"
+        "3. Compare the document against existing project requirements (listed below) and identify direct, substantive contradictions ('EXISTING_VS_NEW'). Reference the database UUID. Do NOT flag mere thematic overlaps. Keep description and recommendation to 1 concise sentence each.\n"
+        "4. Detect direct contradictions among the newly extracted requirements within the document ('NEW_VS_NEW'). Reference both temporary IDs. Keep description and recommendation to 1 concise sentence each.\n\n"
         f"{existing_reqs_text}\n\n"
         "Return a structured JSON response matching the extraction schema."
     )
