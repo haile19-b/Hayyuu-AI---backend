@@ -5,7 +5,7 @@ from io import BytesIO
 from google import genai
 
 from app.agents.requirements_extractor.schema import ExtractionResponse, SuggestionsResponse
-from app.agents.requirements_extractor.tools import call_gemini_with_fallback
+from app.agents.requirements_extractor.tools import call_gemini_with_fallback, clean_json_response
 from app.core.database import prisma
 from prisma import Json
 from app.core.storage import storage_utility
@@ -62,28 +62,52 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     if not file_uri:
         raise ValueError("Gemini file URI is missing. Ingestion node must run first.")
         
+    # 0. State & Database Idempotency Check: check if requirements were already extracted for this document
+    if state.get("requirements_completed") and state.get("extracted_requirement_ids"):
+        logger.info(f"[Node: extract_requirements] Requirements already completed in state for {doc_id}. Skipping.")
+        await publish_progress(doc_id, "Requirements already extracted for this document. Reusing existing requirements.", "extract_requirements")
+        return {
+            "requirements_completed": True,
+            "extracted_requirement_ids": state["extracted_requirement_ids"]
+        }
+
+    existing_marker = await prisma.aisuggestion.find_first(
+        where={
+            "projectId": proj_id,
+            "type": "doc_requirements_extracted",
+        }
+    )
+    if existing_marker and isinstance(existing_marker.content, dict) and existing_marker.content.get("documentId") == doc_id:
+        cached_ids = existing_marker.content.get("requirementIds", [])
+        if cached_ids:
+            existing_count = await prisma.requirement.count(where={"id": {"in": cached_ids}})
+            if existing_count > 0:
+                logger.info(f"[Node: extract_requirements] Found {existing_count} previously extracted requirements in DB for doc {doc_id}. Skipping re-extraction.")
+                await publish_progress(doc_id, f"Found {existing_count} previously extracted requirements in database. Reusing existing requirements.", "extract_requirements")
+                return {
+                    "requirements_completed": True,
+                    "extracted_requirement_ids": cached_ids
+                }
+
     # 1. Retrieve existing project requirements from DB to check for conflicts
     await publish_progress(doc_id, "Checking existing project requirements for conflicts...", "extract_requirements")
     existing_reqs = await prisma.requirement.find_many(where={"projectId": proj_id})
     existing_reqs_text = ""
     if existing_reqs:
-        existing_reqs_text = "Here is a summary of existing requirements in the project (use for EXISTING_VS_NEW conflicts):\n"
-        for r in existing_reqs:
-            desc_preview = (r.description[:120] + "...") if len(r.description) > 120 else r.description
-            existing_reqs_text += f"- [UUID: {r.id}] {r.title}: {desc_preview}\n"
+        # Scope to 30 most recent existing requirements to avoid excessive prompt token overhead
+        scoped_reqs = existing_reqs[-30:] if len(existing_reqs) > 30 else existing_reqs
+        existing_reqs_text = "Summary of existing project requirements (use for EXISTING_VS_NEW conflicts):\n"
+        for r in scoped_reqs:
+            existing_reqs_text += f"- [{r.id}] {r.title} ({r.type}, {r.priority})\n"
     else:
-        existing_reqs_text = "There are no existing requirements in the database for this project."
+        existing_reqs_text = "No existing requirements in database for this project."
         
     prompt = (
         "You are an expert systems analyst. Analyze the provided document and perform four tasks:\n"
-        "1. Extract all functional and non-functional software requirements mentioned in it. Assign each a unique temporary ID (e.g., 'new_req_1', 'new_req_2').\n"
-        "2. For each requirement, automatically generate associated specific developer tasks needed to implement that requirement.\n"
-        "3. Compare the document against the list of existing requirements in the database (provided below) "
-        "and identify any conflicts, contradictions, or duplicate requirements between the document and the existing requirements. "
-        "For these conflicts, classify them as 'EXISTING_VS_NEW' and reference the database UUID of the existing requirement.\n"
-        "4. Detect contradictions or inconsistencies among the newly extracted requirements within the uploaded document itself. "
-        "For these conflicts, classify them as 'NEW_VS_NEW' and reference the temporary IDs of both requirements in conflict.\n\n"
-        "Guidelines: Keep requirement and task descriptions actionable, technical, concise (1-2 sentences each), and avoid fluff.\n\n"
+        "1. Extract the core functional and non-functional software requirements (target 10-15 key requirements; consolidate related minor items; avoid trivial UI styling or standard defaults). Assign each a unique temporary ID (e.g., 'new_req_1', 'new_req_2').\n"
+        "2. For each requirement, generate 1-2 short, general milestone tasks needed to implement it (e.g., 'Implement Auth API'). Do NOT generate granular subtasks, step-by-step developer checklists, or unit test suites. Keep task titles short (max 8 words) and descriptions to 1 concise sentence.\n"
+        "3. Compare the document against existing project requirements (listed below) and identify direct, substantive contradictions ('EXISTING_VS_NEW'). Reference the database UUID. Do NOT flag mere thematic overlaps. Keep description and recommendation to 1 concise sentence each.\n"
+        "4. Detect direct contradictions among the newly extracted requirements within the document ('NEW_VS_NEW'). Reference both temporary IDs. Keep description and recommendation to 1 concise sentence each.\n\n"
         f"{existing_reqs_text}\n\n"
         "Return a structured JSON response matching the extraction schema."
     )
@@ -102,11 +126,12 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     )
     
     try:
-        data = json.loads(response_text)
+        clean_text = clean_json_response(response_text)
+        data = json.loads(clean_text)
         reqs = data.get("requirements", [])
         detected_conflicts = data.get("conflicts", [])
     except Exception as e:
-        logger.error(f"Failed to parse JSON response from Gemini: {e}. Raw response: {response_text}")
+        logger.error(f"Failed to parse JSON response from Gemini: {e}. Raw response: {response_text[:300]}")
         raise ValueError(f"Gemini joint extraction returned invalid JSON: {e}")
         
     # Save Requirements & Tasks
@@ -236,9 +261,24 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
         message=f"Joint processing complete. Saved {req_created} requirements, {task_created} tasks, and flagged {conflicts_created} conflicts.",
         step="extract_requirements"
     )
+    # Save a tracking marker in DB to guarantee idempotency across retries
+    if req_created_ids:
+        await prisma.aisuggestion.create(
+            data={
+                "projectId": proj_id,
+                "type": "doc_requirements_extracted",
+                "content": Json({
+                    "documentId": doc_id,
+                    "requirementIds": req_created_ids
+                }),
+                "status": SuggestionStatus.ACCEPTED
+            }
+        )
+
     logger.info(f"Saved {req_created} requirements, {task_created} tasks, and {conflicts_created} conflicts in DB")
     
     return {
+        "requirements_completed": True,
         "extracted_requirement_ids": req_created_ids
     }
 
@@ -250,6 +290,31 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
     file_mime_type = state.get("gemini_file_mime_type")
     
     logger.info(f"[Node: generate_suggestions] Extracting product gap suggestions for document {doc_id}")
+    
+    # 0. State & Database Idempotency Check: check if suggestions were already generated for this document
+    if state.get("suggestions_completed"):
+        logger.info(f"[Node: generate_suggestions] Suggestions already completed in state for doc {doc_id}. Skipping.")
+        await publish_progress(doc_id, "Suggestions already generated for this document. Reusing existing suggestions.", "generate_suggestions")
+        return {
+            "suggestions_completed": True,
+            "suggestions_count": state.get("suggestions_count", 0)
+        }
+
+    existing_suggestions = await prisma.aisuggestion.find_many(
+        where={"projectId": proj_id, "type": "gap_analysis"}
+    )
+    doc_suggestions = [
+        s for s in existing_suggestions
+        if isinstance(s.content, dict) and s.content.get("documentId") == doc_id
+    ]
+    if doc_suggestions:
+        logger.info(f"[Node: generate_suggestions] Found {len(doc_suggestions)} existing suggestions in DB for doc {doc_id}. Skipping re-extraction.")
+        await publish_progress(doc_id, f"Found {len(doc_suggestions)} previously generated suggestions in database. Reusing existing suggestions.", "generate_suggestions")
+        return {
+            "suggestions_completed": True,
+            "suggestions_count": len(doc_suggestions)
+        }
+
     await publish_progress(doc_id, "Analyzing document for product gaps and improvements...", "generate_suggestions")
     
     if not file_uri:
@@ -257,11 +322,11 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     prompt = (
         "You are an experienced product manager. Analyze the provided project document "
-        "and identify key product gaps, missing requirements, or improvements that should be made "
-        "to ensure project success.\n\n"
-        "Generate a concise list of actionable suggestions (max 5-7 key suggestions). "
-        "For each suggestion, provide a title, concise description (1-2 sentences), "
-        "reasoning (why it is a gap/improvement), and category ('security', 'usability', 'performance', 'scalability', or 'other')."
+        "and identify critical product gaps, missing architectural requirements, or improvements.\n\n"
+        "Generate a concise list of 3-5 high-impact suggestions only. "
+        "For each suggestion, provide a short title (max 8 words), a 1-sentence description of the gap/change, "
+        "a 1-sentence reasoning explaining why it is critical, and its category ('security', 'usability', 'performance', 'scalability', or 'other'). "
+        "Keep descriptions concise and avoid narrative preambles."
     )
     
     # Micro-stagger to avoid simultaneous burst collision with parallel extract_requirements node
@@ -279,15 +344,19 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
     )
     
     try:
-        data = json.loads(response_text)
+        clean_text = clean_json_response(response_text)
+        data = json.loads(clean_text)
         suggestions = data.get("suggestions", [])
     except Exception as e:
-        logger.error(f"Failed to parse suggestions JSON from Gemini: {e}")
+        logger.error(f"Failed to parse suggestions JSON from Gemini: {e}. Raw response: {response_text[:300]}")
         raise ValueError(f"Gemini suggestions extraction returned invalid JSON: {e}")
         
     if not suggestions:
         await publish_progress(doc_id, "No suggestions or product gaps detected.", "generate_suggestions")
-        return {}
+        return {
+            "suggestions_completed": True,
+            "suggestions_count": 0
+        }
         
     await publish_progress(doc_id, f"Saving {len(suggestions)} AI suggestions to the database...", "generate_suggestions")
     
@@ -297,6 +366,7 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
                 "projectId": proj_id,
                 "type": "gap_analysis",
                 "content": Json({
+                    "documentId": doc_id,
                     "title": sug["title"],
                     "description": sug["description"],
                     "reasoning": sug["reasoning"],
@@ -312,4 +382,7 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
         
     await publish_progress(doc_id, f"Gap analysis complete. Saved {created_count} gap improvement suggestions.", "generate_suggestions")
     logger.info(f"Saved {created_count} AISuggestions to the database.")
-    return {}
+    return {
+        "suggestions_completed": True,
+        "suggestions_count": created_count
+    }

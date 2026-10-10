@@ -1,6 +1,7 @@
 import logging
 import asyncio
 import random
+import re
 from typing import Any, List, Optional
 from google.genai import errors
 from app.core.config import genAI
@@ -8,6 +9,52 @@ from app.core.env import settings
 from app.core.progress import publish_progress
 
 logger = logging.getLogger("uvicorn.error")
+
+def clean_json_response(raw: str) -> str:
+    """
+    Cleans and extracts valid JSON string from LLM responses:
+    1. Strips leading/trailing whitespace.
+    2. Strips Markdown code blocks: ```json ... ``` or ``` ... ```
+    3. If markdown fences are absent but extra prose exists, extracts outermost {...} or [...].
+    """
+    if not raw:
+        return ""
+    
+    text = raw.strip()
+    
+    # Check if enclosed in Markdown code fences
+    fence_pattern = r"^```(?:json)?\s*([\s\S]*?)\s*```$"
+    fence_match = re.search(fence_pattern, text, re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1).strip()
+    
+    # If text starts with ``` (even if closing fence is missing or followed by text)
+    if text.startswith("```"):
+        lines = text.splitlines()
+        start_idx = 1
+        end_idx = len(lines)
+        for i in range(len(lines) - 1, 0, -1):
+            if lines[i].strip().startswith("```"):
+                end_idx = i
+                break
+        inner = "\n".join(lines[start_idx:end_idx]).strip()
+        if inner:
+            return inner
+
+    # Fallback: extract outermost JSON object {...} or array [...] if prose surrounded it
+    first_brace = text.find("{")
+    first_bracket = text.find("[")
+    
+    if first_brace != -1 and (first_bracket == -1 or first_brace < first_bracket):
+        last_brace = text.rfind("}")
+        if last_brace != -1 and last_brace > first_brace:
+            return text[first_brace : last_brace + 1].strip()
+    elif first_bracket != -1:
+        last_bracket = text.rfind("]")
+        if last_bracket != -1 and last_bracket > first_bracket:
+            return text[first_bracket : last_bracket + 1].strip()
+
+    return text
 
 def _is_transient_error(e: Exception) -> bool:
     """Check if an exception represents a temporary, retryable server-side capacity/rate-limit error."""
@@ -51,7 +98,12 @@ async def call_gemini_with_fallback(
     2. Exponential backoff with jitter on transient errors (503 High Demand, 429 Rate Limits, 500 Server Errors).
     3. Real-time progress updates published to Redis via publish_progress.
     """
-    models = settings.GEMINI_MODELS if settings.GEMINI_MODELS else ["gemini-3.8-flash", "gemini-2.5-flash"]
+    models = settings.GEMINI_MODELS if settings.GEMINI_MODELS else [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+    ]
     last_error: Optional[Exception] = None
     
     for model_index, model_name in enumerate(models):
@@ -76,7 +128,8 @@ async def call_gemini_with_fallback(
                         "schema": response_schema.model_json_schema()
                     }
                 )
-                return response.output_text
+                output_raw = getattr(response, "output_text", None) or getattr(response, "text", "")
+                return clean_json_response(output_raw)
             except Exception as e:
                 last_error = e
                 is_transient = _is_transient_error(e)

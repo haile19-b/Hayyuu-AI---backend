@@ -2,7 +2,7 @@ import logging
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from app.core.env import settings
-from app.core.database import prisma
+from app.core.database import prisma, ensure_db_connected
 from app.core.progress import publish_progress
 from prisma.enums import DocumentStatus
 
@@ -83,6 +83,7 @@ async def run_workflow(document_id: str, project_id: str) -> None:
         await run_knowledge_builder(kb_state)
             
         # Update document status in the database to INDEXED upon successful completion
+        await ensure_db_connected()
         await prisma.document.update(
             where={"id": document_id},
             data={"status": DocumentStatus.INDEXED}

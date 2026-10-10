@@ -1,19 +1,15 @@
 import re
 import logging
 from typing import Any, Dict, List, Optional
-from io import BytesIO
 
 logger = logging.getLogger("uvicorn.error")
 
 try:
-    from docling.document_converter import DocumentConverter
-    from docling.datamodel.base_models import DocumentStream
     from docling.chunking import HybridChunker
-    doc_chunker_converter = DocumentConverter()
-    logger.info("✅ Docling Chunker Converter Initialized Successfully")
+    logger.info("✅ Docling HybridChunker Initialized Successfully")
 except Exception as chunk_err:
     logger.error(f"Failed to initialize Docling chunker imports: {chunk_err}")
-    doc_chunker_converter = None
+    HybridChunker = None
 
 
 def estimate_tokens(text: str) -> int:
@@ -195,21 +191,19 @@ def chunk_document_text(
     text: str,
     chunk_size_tokens: int = 500,
     chunk_overlap_tokens: int = 100,
+    docling_doc: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Ingests raw document text, converts it to a Docling document in-memory,
+    Ingests document text or an already converted DoclingDocument instance,
     and runs a layout-aware HybridChunker to preserve sections, headers, and tables.
-    Consolidates short fragments and falls back to RecursiveTextSplitter on error.
+    Consolidates short fragments and falls back to RecursiveTextSplitter on error or when DoclingDocument is absent.
     """
-    # 1. Attempt layout-aware chunking via IBM Docling
-    if doc_chunker_converter:
+    # 1. Attempt layout-aware chunking via IBM Docling HybridChunker if docling_doc is provided
+    if docling_doc is not None and HybridChunker is not None:
         logger.info(f"Attempting layout-aware chunking via Docling HybridChunker (max={chunk_size_tokens} tokens)")
         try:
-            source = DocumentStream(name="document.txt", stream=BytesIO(text.encode("utf-8")))
-            result = doc_chunker_converter.convert(source)
             chunker = HybridChunker(max_tokens=chunk_size_tokens)
-            
-            raw_chunks = list(chunker.chunk(result.document))
+            raw_chunks = list(chunker.chunk(docling_doc))
             structured_chunks: List[Dict[str, Any]] = []
             
             start_offset = 0
@@ -257,7 +251,7 @@ def chunk_document_text(
         except Exception as e:
             logger.warning(f"Docling chunker failed: {e}. Falling back to RecursiveTextSplitter.")
 
-    # 2. Legacy fallback
+    # 2. Character-based recursive text splitter fallback
     logger.info("Using RecursiveTextSplitter character chunker fallback")
     splitter = RecursiveTextSplitter(
         chunk_size_tokens=chunk_size_tokens,
