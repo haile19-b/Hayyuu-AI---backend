@@ -48,8 +48,6 @@ async def run_knowledge_builder(state: KnowledgeBuilderState) -> None:
     
     # Initialize persistent state checkpointer
     async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
-        await checkpointer.setup()
-        
         # Compile graph with saver checkpointer
         graph = workflow.compile(checkpointer=checkpointer)
         config = {"configurable": {"thread_id": thread_id}}

@@ -47,7 +47,8 @@ async def ingest_document_node(state: DocumentAnalysisState) -> dict:
     
     return {
         "gemini_file_uri": gemini_file.uri,
-        "gemini_file_mime_type": gemini_file.mime_type
+        "gemini_file_mime_type": gemini_file.mime_type,
+        "document_name": document.name,
     }
 
 # Node 2: Extract Requirements + Tasks + Conflicts (Joint Gemini Processing)
