@@ -12,6 +12,8 @@ from app.agents.requirements_extractor.nodes import (
     extract_requirements_node,
     generate_suggestions_node,
 )
+from app.agents.knowledge_builder.graph import run_knowledge_builder
+from app.agents.knowledge_builder.state import KnowledgeBuilderState
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -33,9 +35,6 @@ async def run_workflow(document_id: str, project_id: str) -> None:
     
     # Initialize connection to PostgreSQL for state checkpoints
     async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
-        # Create checkpoint tables if they do not exist
-        await checkpointer.setup()
-        
         # Compile graph with checkpointing
         graph = builder.compile(checkpointer=checkpointer)
         
@@ -44,32 +43,41 @@ async def run_workflow(document_id: str, project_id: str) -> None:
         
         # Check if there is an existing state checkpoint to resume from
         state = await graph.aget_state(config)
+        final_state = None
         if state and state.next:
             logger.info(f"Resuming document analysis workflow for {document_id} from node: {state.next}")
-            await graph.ainvoke(None, config=config)
+            final_state = await graph.ainvoke(None, config=config)
         elif state and not state.next and state.values:
             logger.info(f"Document analysis workflow already completed for {document_id}. Skipping requirements extraction.")
+            final_state = state.values
         else:
             logger.info(f"Starting new document analysis workflow execution for {document_id}")
             initial_state = {
                 "project_id": project_id,
                 "document_id": document_id
             }
-            await graph.ainvoke(initial_state, config=config)
+            final_state = await graph.ainvoke(initial_state, config=config)
             
-        # 1. Fetch document name for filename reference
-        document = await prisma.document.find_unique(where={"id": document_id})
-        filename = document.name if document else "document"
+        if not isinstance(final_state, dict):
+            final_state = {}
 
-        # 2. Extract the Gemini file URI if available from the requirements extractor checkpoint
-        state_after = await graph.aget_state(config)
-        gemini_file_uri = state_after.values.get("gemini_file_uri") if state_after else None
-        gemini_file_mime_type = state_after.values.get("gemini_file_mime_type") if state_after else None
+        # 1. Resolve document filename and Gemini file URIs directly from completed workflow state
+        gemini_file_uri = final_state.get("gemini_file_uri")
+        gemini_file_mime_type = final_state.get("gemini_file_mime_type")
+        filename = final_state.get("document_name")
+        if not filename:
+            document = await prisma.document.find_unique(where={"id": document_id})
+            filename = document.name if document else "document"
 
-        # 3. Trigger Agent Knowledge Builder dynamically to build PGVector and Neo4j indices
-        from app.agents.knowledge_builder.graph import run_knowledge_builder
-        from app.agents.knowledge_builder.state import KnowledgeBuilderState
-        
+        # 2. Inform client of pipeline transition to knowledge builder
+        await publish_progress(
+            document_id=document_id,
+            message="Requirements extraction complete. Initializing knowledge base construction...",
+            step="transition",
+            status="PROCESSING"
+        )
+
+        # 3. Trigger Agent Knowledge Builder to build PGVector and Neo4j indices
         logger.info(f"Triggering Agent Knowledge Builder for document {document_id}")
         await publish_progress(document_id, "Building knowledge graph and vector indices...", "knowledge_builder")
         
