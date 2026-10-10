@@ -84,10 +84,30 @@ async def analyze_document_job(ctx, document_id: str, project_id: str) -> None:
         raise e
 
 async def startup(ctx) -> None:
-    """Background worker startup hook to connect to database and Redis."""
+    """Background worker startup hook to connect to database and Redis, and pre-warm agent pipelines."""
     await connect_db()
     await connect_redis()
-    logger.info("Worker connections initialized")
+    logger.info("Worker database & Redis connections initialized")
+
+    try:
+        # 1. Initialize LangGraph Postgres checkpointer tables once on worker boot
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+        async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
+            await checkpointer.setup()
+        logger.info("LangGraph checkpointer tables verified on worker startup")
+    except Exception as cp_err:
+        logger.warning(f"Failed to pre-setup LangGraph checkpointer tables on worker startup: {cp_err}")
+
+    try:
+        # 2. Pre-warm agent pipelines and deep learning modules in memory
+        logger.info("Pre-warming agent pipelines and model dependencies...")
+        import app.agents.requirements_extractor.graph
+        import app.agents.knowledge_builder.graph
+        from app.core.text_extractor import get_doc_converter
+        get_doc_converter()
+        logger.info("Agent pipelines and model dependencies pre-warmed successfully")
+    except Exception as warm_err:
+        logger.warning(f"Agent pipelines pre-warming encountered an issue (non-fatal): {warm_err}")
 
 async def shutdown(ctx) -> None:
     """Background worker shutdown hook to disconnect database and Redis."""
