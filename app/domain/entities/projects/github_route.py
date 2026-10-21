@@ -754,6 +754,23 @@ async def get_github_live_data(
         else:
             target_owner = matched.owner
             target_repo = matched.name
+            if not matched.isActive:
+                await prisma.projectrepository.update_many(
+                    where={"projectId": projectId},
+                    data={"isActive": False},
+                )
+                await prisma.projectrepository.update(
+                    where={"id": matched.id},
+                    data={"isActive": True},
+                )
+                await prisma.project.update(
+                    where={"id": projectId},
+                    data={
+                        "githubRepoOwner": matched.owner,
+                        "githubRepoName": matched.name,
+                        "githubRepoUrl": matched.htmlUrl or f"https://github.com/{matched.fullName}",
+                    },
+                )
     else:
         # Use active assigned repository or fallback to Project active fields
         active_rec = next((r for r in assigned_repos if r.isActive), None)
