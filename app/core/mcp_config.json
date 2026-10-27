@@ -1,12 +1,9 @@
 {
   "mcpServers": {
-    "db-graph": {
+    "hayyuu-mcp": {
+      "transport": "stdio",
       "command": "uv",
-      "args": ["run", "python", "-m", "app.infrastructure.mcp.db_graph_server"]
-    },
-    "fetch": {
-      "command": "uvx",
-      "args": ["--with", "mcp<2", "mcp-server-fetch"]
+      "args": ["run", "--no-sync", "python", "-m", "app.infrastructure.mcp.server"]
     }
   }
 }
