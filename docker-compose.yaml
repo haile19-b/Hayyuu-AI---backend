@@ -43,22 +43,64 @@ services:
       - neo4j_data:/data
     restart: always
 
+  # Standalone Production Model Context Protocol (MCP) Server Container
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: mcp
+    image: hayyuu_mcp:latest
+    container_name: hayyuu_mcp
+    command: uv run --no-sync python -m app.infrastructure.mcp.server --transport sse --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      UV_NO_SYNC: "1"
+      UV_NO_DEV: "1"
+      MCP_TRANSPORT: "sse"
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8001"
+      REDIS_URL: redis://redis:6379/0
+      NEO4J_URI: bolt://neo4j:7687
+    volumes:
+      - .:/app # Hot reloading mount for source code
+      - /app/.venv # Anonymous volume preserving container's Linux virtualenv
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   # Method C: FastAPI Web API Container
   web:
     build:
       context: .
       dockerfile: Dockerfile
+      target: core
+    image: hayyuu_core:latest
     container_name: hayyuu_web
-    command: uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uv run --no-sync uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     ports:
       - "8000:8000"
     env_file:
       - .env
     environment:
       # Network overrides for containerized communication
+      UV_NO_SYNC: "1"
+      UV_NO_DEV: "1"
       REDIS_URL: redis://redis:6379/0
       ENABLE_EMBEDDED_WORKER: "false" # Dedicated worker container handles tasks
       NEO4J_URI: bolt://neo4j:7687
+      HAYYUU_MCP_URL: http://mcp:8001/sse
       # Uncomment below to connect directly to the local postgres container instead of Neon:
       # DATABASE_URL: postgresql://postgres:password@postgres:5432/hayyuu_db
     volumes:
@@ -69,6 +111,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      mcp:
+        condition: service_healthy
     restart: unless-stopped
 
   # Method C: Background Task ARQ Worker Container
@@ -76,14 +120,19 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: worker
+    image: hayyuu_worker:latest
     # Note: Omit fixed container_name to allow horizontal scaling via --scale worker=N
-    command: uv run arq app.core.queue.WorkerSettings
+    command: uv run --no-sync arq app.core.queue.WorkerSettings
     env_file:
       - .env
     environment:
       # Network overrides for containerized communication
+      UV_NO_SYNC: "1"
+      UV_NO_DEV: "1"
       REDIS_URL: redis://redis:6379/0
       NEO4J_URI: bolt://neo4j:7687
+      HAYYUU_MCP_URL: http://mcp:8001/sse
       # Uncomment below to connect directly to the local postgres container instead of Neon:
       # DATABASE_URL: postgresql://postgres:password@postgres:5432/hayyuu_db
     volumes:
@@ -93,6 +142,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      mcp:
         condition: service_healthy
     restart: unless-stopped
 
