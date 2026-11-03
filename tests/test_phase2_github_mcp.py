@@ -138,6 +138,48 @@ async def test_tool_get_file_contents_base64_decoding(mcp_server):
 
 
 @pytest.mark.asyncio
+async def test_tool_get_file_contents_full_github_url_and_line_slicing(mcp_server):
+    """Verifies get_file_contents parses full GitHub blob URLs and applies line slicing."""
+    code_lines = [f"line {i}" for i in range(1, 21)]
+    raw_code = "\n".join(code_lines)
+    encoded = base64.b64encode(raw_code.encode("utf-8")).decode("utf-8")
+
+    mock_resp = Response(
+        status_code=200,
+        json={"name": "package.json", "path": "package.json", "encoding": "base64", "content": encoded, "size": len(raw_code)}
+    )
+
+    with patch("app.infrastructure.mcp.tools.github_tools.get_github_auth_headers", new_callable=AsyncMock) as mock_auth, \
+         patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_http_get:
+        mock_auth.return_value = {"Authorization": "Bearer test"}
+        mock_http_get.return_value = mock_resp
+
+        # 1. Full GitHub blob URL + Line Slicing lines 5-8
+        result = await mcp_server.call_tool(
+            "get_file_contents",
+            {
+                "project_id": "pid",
+                "repo": "haile19-b/my-todo",
+                "path": "https://github.com/haile19-b/my-todo/blob/main/package.json",
+                "start_line": 5,
+                "end_line": 8
+            }
+        )
+        text = result.content[0].text
+        assert "[File: 'package.json' | Lines 5-8 of 20 | Repo: 'haile19-b/my-todo' | Ref: 'main']" in text
+        assert "5 | line 5" in text
+        assert "8 | line 8" in text
+        assert "line 4" not in text
+        assert "line 9" not in text
+
+        # Verify the requested URL to GitHub API was cleaned to relative path
+        mock_http_get.assert_called()
+        call_url = mock_http_get.call_args[0][0]
+        assert call_url == "https://api.github.com/repos/haile19-b/my-todo/contents/package.json"
+        assert mock_http_get.call_args[1]["params"]["ref"] == "main"
+
+
+@pytest.mark.asyncio
 async def test_tool_create_issue_and_alias(mcp_server):
     """Verifies create_issue and create_github_issue alias both post to GitHub API."""
     mock_resp = Response(
