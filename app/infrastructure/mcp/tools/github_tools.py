@@ -1,5 +1,6 @@
 import base64
 import logging
+import re
 from typing import List, Optional, Dict, Any
 from mcp.server import MCPServer
 import httpx
@@ -52,6 +53,43 @@ def _clean_repo(repo: str) -> str:
     return r.strip("/")
 
 
+def _parse_github_file_target(
+    repo: str,
+    path: str,
+    ref: Optional[str] = None
+) -> tuple[str, str, Optional[str]]:
+    """
+    Normalizes repo, relative file path, and ref from either standard relative paths
+    or full GitHub web URLs (e.g. 'https://github.com/owner/repo/blob/main/path/to/file').
+    """
+    clean_r = _clean_repo(repo)
+    clean_p = path.strip()
+    clean_ref = ref
+
+    # Match full GitHub URLs e.g. https://github.com/owner/repo/blob/branch/path/to/file
+    url_match = re.match(
+        r"^https?://github\.com/([^/]+/[^/]+)/(?:blob|raw|tree)/([^/]+)/(.+)$",
+        clean_p
+    )
+    if url_match:
+        extracted_repo, extracted_ref, extracted_path = url_match.groups()
+        clean_r = _clean_repo(extracted_repo)
+        clean_ref = ref or extracted_ref
+        clean_p = extracted_path
+
+    # Match partial blob/branch/path strings
+    prefix_match = re.match(
+        r"^(?:blob|raw|tree)/([^/]+)/(.+)$",
+        clean_p.lstrip("/")
+    )
+    if prefix_match:
+        extracted_ref, extracted_path = prefix_match.groups()
+        clean_ref = ref or extracted_ref
+        clean_p = extracted_path
+
+    return clean_r, clean_p.lstrip("/"), clean_ref
+
+
 def register_github_tools(mcp: MCPServer) -> None:
     """Registers the complete 21-tool multi-tenant GitHub suite on the given MCPServer."""
 
@@ -60,24 +98,37 @@ def register_github_tools(mcp: MCPServer) -> None:
     # =====================================================================
 
     @mcp.tool()
-    async def get_file_contents(project_id: str, repo: str, path: str, ref: Optional[str] = None) -> str:
+    async def get_file_contents(
+        project_id: str,
+        repo: str,
+        path: str,
+        ref: Optional[str] = None,
+        start_line: Optional[int] = None,
+        end_line: Optional[int] = None
+    ) -> str:
         """
-        Retrieves the contents of a file or directory in a GitHub repository.
+        Retrieves the contents of a file or directory in a GitHub repository,
+        with optional line slicing to optimize LLM context window usage.
 
         Args:
             project_id: Active project UUID.
             repo: Target repository (e.g. 'owner/repo').
-            path: Path to the file or directory.
+            path: Path to the file/directory (e.g. 'package.json') or full GitHub blob URL.
             ref: Optional branch, tag, or commit SHA.
+            start_line: Optional 1-based start line number to inspect a specific code range.
+            end_line: Optional 1-based end line number to inspect a specific code range.
         """
-        clean_r = _clean_repo(repo)
-        logger.info(f"[mcp: get_file_contents] Fetching '{path}' in '{clean_r}' for project '{project_id}'")
+        clean_r, clean_p, clean_ref = _parse_github_file_target(repo, path, ref)
+        logger.info(
+            f"[mcp: get_file_contents] Fetching '{clean_p}' in '{clean_r}' "
+            f"(ref: {clean_ref}, lines: {start_line}-{end_line}) for project '{project_id}'"
+        )
         try:
             headers = await get_github_auth_headers(project_id)
-            url = f"{GITHUB_API_BASE}/repos/{clean_r}/contents/{path.lstrip('/')}"
+            url = f"{GITHUB_API_BASE}/repos/{clean_r}/contents/{clean_p}"
             params = {}
-            if ref:
-                params["ref"] = ref
+            if clean_ref:
+                params["ref"] = clean_ref
 
             async with httpx.AsyncClient(timeout=20.0) as client:
                 res = await client.get(url, headers=headers, params=params)
@@ -88,18 +139,57 @@ def register_github_tools(mcp: MCPServer) -> None:
                 if isinstance(data, list):
                     # Directory listing
                     entries = [f"- [{item.get('type')}] {item.get('name')} (path: {item.get('path')})" for item in data]
-                    return f"Directory listing for '{path}':\n" + "\n".join(entries)
+                    return f"Directory listing for '{clean_p}':\n" + "\n".join(entries)
 
                 encoding = data.get("encoding")
                 raw_content = data.get("content", "")
+                decoded = None
                 if encoding == "base64" and raw_content:
                     try:
                         decoded = base64.b64decode(raw_content).decode("utf-8")
-                        return decoded
                     except UnicodeDecodeError:
                         return f"[Binary file: {data.get('size')} bytes, sha: {data.get('sha')}]"
+                elif raw_content:
+                    decoded = raw_content
 
-                return raw_content or f"[File size: {data.get('size')} bytes, sha: {data.get('sha')}]"
+                if decoded is None:
+                    return f"[Empty file: {data.get('size')} bytes, sha: {data.get('sha')}]"
+
+                # Check if line range slicing is requested or if file is large (> 300 lines)
+                lines = decoded.splitlines()
+                total_lines = len(lines)
+
+                # Case 1: Caller specified start_line or end_line
+                if start_line is not None or end_line is not None:
+                    start = max(1, start_line) if start_line is not None else 1
+                    if start > total_lines:
+                        return f"[File: '{clean_p}' | Total lines: {total_lines} | Requested start_line {start_line} exceeds file length]"
+                    end = min(total_lines, max(start, end_line)) if end_line is not None else total_lines
+                    selected = lines[start - 1 : end]
+                    numbered = [f"{start + i:4d} | {line}" for i, line in enumerate(selected)]
+                    header = (
+                        f"[File: '{clean_p}' | Lines {start}-{end} of {total_lines} | Repo: '{clean_r}'"
+                        + (f" | Ref: '{clean_ref}'" if clean_ref else "")
+                        + "]\n"
+                    )
+                    return header + "\n".join(numbered)
+
+                # Case 2: File exceeds context safety threshold (> 300 lines) and no slice was requested
+                if total_lines > 300:
+                    preview = [f"{i + 1:4d} | {line}" for i, line in enumerate(lines[:300])]
+                    notice = (
+                        f"\n\n--- [Output truncated: showing lines 1-300 of {total_lines}. "
+                        f"To view other sections, pass 'start_line=301' and 'end_line=...' to get_file_contents] ---"
+                    )
+                    header = (
+                        f"[File: '{clean_p}' | Showing first 300 of {total_lines} lines | Repo: '{clean_r}'"
+                        + (f" | Ref: '{clean_ref}'" if clean_ref else "")
+                        + "]\n"
+                    )
+                    return header + "\n".join(preview) + notice
+
+                # Case 3: Compact file (<= 300 lines) without slice: return raw content
+                return decoded
         except Exception as e:
             logger.error(f"Error in get_file_contents: {e}")
             return f"Error fetching file contents: {str(e)}"

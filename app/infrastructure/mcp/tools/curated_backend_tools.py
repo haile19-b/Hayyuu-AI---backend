@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from typing import Optional
 from mcp.server import MCPServer
 from prisma.enums import TaskStatus, TaskPriority, TaskApprovalStatus, TaskSource
@@ -25,21 +26,20 @@ def register_curated_backend_tools(mcp: MCPServer) -> None:
                 where={"id": project_id},
                 include={
                     "repositories": True,
-                    "_count": {
-                        "select": {
-                            "documents": True,
-                            "requirements": True,
-                            "tasks": True,
-                            "conflicts": True,
-                            "suggestions": True,
-                        }
-                    }
                 }
             )
             if not project:
                 return f"Error: Project '{project_id}' not found."
 
-            counts = getattr(project, "_count", None) or {}
+            # Query relation counts concurrently via asyncio.gather
+            doc_c, req_c, task_c, conf_c, sugg_c = await asyncio.gather(
+                prisma.document.count(where={"projectId": project_id}),
+                prisma.requirement.count(where={"projectId": project_id}),
+                prisma.task.count(where={"projectId": project_id}),
+                prisma.requirementconflict.count(where={"projectId": project_id}),
+                prisma.aisuggestion.count(where={"projectId": project_id}),
+            )
+
             repo_info = "None"
             if project.repositories:
                 repo_info = ", ".join([r.fullName for r in project.repositories])
@@ -51,11 +51,11 @@ def register_curated_backend_tools(mcp: MCPServer) -> None:
                 f"- Description: {project.description or 'No description'}\n"
                 f"- Status: {project.status}\n"
                 f"- Connected GitHub Repositories: {repo_info}\n"
-                f"- Documents Count: {getattr(counts, 'documents', 'N/A')}\n"
-                f"- Requirements Count: {getattr(counts, 'requirements', 'N/A')}\n"
-                f"- Tasks Count: {getattr(counts, 'tasks', 'N/A')}\n"
-                f"- Active Conflicts Count: {getattr(counts, 'conflicts', 'N/A')}\n"
-                f"- AI Suggestions Count: {getattr(counts, 'suggestions', 'N/A')}"
+                f"- Documents Count: {doc_c}\n"
+                f"- Requirements Count: {req_c}\n"
+                f"- Tasks Count: {task_c}\n"
+                f"- Active Conflicts Count: {conf_c}\n"
+                f"- AI Suggestions Count: {sugg_c}"
             )
         except Exception as e:
             logger.error(f"Error fetching project overview: {e}")
@@ -67,6 +67,7 @@ def register_curated_backend_tools(mcp: MCPServer) -> None:
         title: str,
         description: str,
         priority: str = "P2",
+        status: str = "TODO",
         requirement_id: Optional[str] = None
     ) -> str:
         """
@@ -76,7 +77,8 @@ def register_curated_backend_tools(mcp: MCPServer) -> None:
             project_id: The UUID of the project.
             title: The title of the task.
             description: Detailed technical task description and acceptance criteria.
-            priority: Priority level (P0, P1, P2). Default is P2.
+            priority: Priority level ('P0' = Critical, 'P1' = High, 'P2' = Normal). Default is 'P2'.
+            status: Initial task status ('TODO', 'IN_PROGRESS', 'DONE', 'BLOCKED'). Default is 'TODO'.
             requirement_id: Optional UUID of the requirement this task satisfies.
         """
         logger.info(f"[mcp: create_project_task] Creating task '{title}' for project '{project_id}'")
@@ -88,6 +90,22 @@ def register_curated_backend_tools(mcp: MCPServer) -> None:
             elif priority.upper() == "P1":
                 p_enum = TaskPriority.P1
 
+            # Validate & normalize status
+            status_normalized = status.upper().replace(" ", "_").strip()
+            status_map = {
+                "TODO": TaskStatus.TODO,
+                "IN_PROGRESS": TaskStatus.IN_PROGRESS,
+                "DONE": TaskStatus.DONE,
+                "BLOCKED": TaskStatus.BLOCKED,
+            }
+            if status_normalized not in status_map:
+                allowed_statuses = ", ".join([f"'{s}'" for s in status_map.keys()])
+                return (
+                    f"Error: Invalid task status '{status}'. "
+                    f"Allowed statuses are: {allowed_statuses}."
+                )
+            s_enum = status_map[status_normalized]
+
             task = await prisma.task.create(
                 data={
                     "projectId": project_id,
@@ -95,7 +113,7 @@ def register_curated_backend_tools(mcp: MCPServer) -> None:
                     "title": title,
                     "description": description,
                     "priority": p_enum,
-                    "status": TaskStatus.TODO,
+                    "status": s_enum,
                     "source": TaskSource.SYSTEM,
                     "approvalStatus": TaskApprovalStatus.APPROVED,
                 }
