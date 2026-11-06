@@ -47,8 +47,7 @@ services:
   mcp:
     build:
       context: .
-      dockerfile: Dockerfile
-      target: mcp
+      dockerfile: Dockerfile.mcp
     image: hayyuu_mcp:latest
     container_name: hayyuu_mcp
     command: uv run --no-sync python -m app.infrastructure.mcp.server --transport sse --host 0.0.0.0 --port 8001

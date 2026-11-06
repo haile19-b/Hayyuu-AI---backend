@@ -9,17 +9,19 @@ ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy \
     UV_NO_SYNC=1 \
     UV_NO_DEV=1 \
+    PRISMA_USE_GLOBAL_NODE="true" \
     PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app/.venv/Lib/site-packages:/app"
 
-# Install minimal OS libraries required for Prisma, PostgreSQL, Node/libatomic, curl for healthchecks
+# Install minimal OS libraries required for Prisma, PostgreSQL, Node.js runtime, curl for healthchecks
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     libssl3 \
-    libatomic1 \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
