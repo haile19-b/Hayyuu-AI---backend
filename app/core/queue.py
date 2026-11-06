@@ -54,6 +54,27 @@ async def enqueue_document_analysis(document_id: str, project_id: str) -> None:
     else:
         logger.warning(f"⚠️ Redis is offline. Document {document_id} analysis cannot be enqueued.")
 
+from typing import Optional
+
+async def enqueue_memory_consolidation(user_id: str, project_id: Optional[str], thread_id: str) -> None:
+    """Enqueue an out-of-band episodic memory consolidation background job."""
+    global redis_pool
+    if redis_pool is None:
+        await connect_redis()
+    
+    if redis_pool is not None:
+        try:
+            await redis_pool.enqueue_job("consolidate_memory_job", user_id, project_id, thread_id)
+            logger.info(f"Enqueued memory consolidation for thread {thread_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to enqueue memory consolidation to Redis: {e}")
+    else:
+        logger.warning(f"⚠️ Redis is offline. Memory consolidation for thread {thread_id} falling back to asyncio background task.")
+        try:
+            asyncio.create_task(consolidate_memory_job(None, user_id, project_id or "", thread_id))
+        except Exception as bg_err:
+            logger.error(f"Failed to launch in-process consolidation fallback: {bg_err}")
+
 from prisma.enums import DocumentStatus
 from app.core.database import prisma
 
@@ -81,6 +102,28 @@ async def analyze_document_job(ctx, document_id: str, project_id: str) -> None:
             await publish_progress(document_id, f"Analysis failed: {str(e)}", "error", "FAILED")
         except Exception as pub_err:
             logger.error(f"Failed to publish failure progress: {pub_err}")
+        raise e
+
+async def consolidate_memory_job(ctx, user_id: str, project_id: str, thread_id: str) -> None:
+    """The ARQ background task for cold-path episodic memory extraction and consolidation."""
+    from app.agents.memory.consolidator import consolidate_thread_memories
+    from app.core.database import prisma, ensure_db_connected
+    logger.info(f"Starting background job: consolidate_memory_job for thread={thread_id}")
+    try:
+        await ensure_db_connected()
+        messages = await prisma.chatmessage.find_many(
+            where={"threadId": thread_id},
+            order={"createdAt": "asc"},
+            take=30
+        )
+        msg_dicts = [
+            {"role": m.role.value if hasattr(m.role, "value") else str(m.role), "content": m.content}
+            for m in messages
+        ]
+        consolidated = await consolidate_thread_memories(user_id, project_id, thread_id, msg_dicts)
+        logger.info(f"Completed background job: consolidate_memory_job. Saved {len(consolidated)} memories.")
+    except Exception as e:
+        logger.error(f"Failed background job: consolidate_memory_job for thread={thread_id}. Error: {e}")
         raise e
 
 async def startup(ctx) -> None:
@@ -117,7 +160,7 @@ async def shutdown(ctx) -> None:
 
 class WorkerSettings:
     """Settings required by the arq CLI to run the background worker."""
-    functions = [analyze_document_job]
+    functions = [analyze_document_job, consolidate_memory_job]
     redis_settings = RedisSettings.from_dsn(settings.REDIS_URL)
     on_startup = startup
     on_shutdown = shutdown
