@@ -36,9 +36,14 @@ class MemoryItemResponse(BaseModel):
     updatedAt: str
 
 
+import re
+
 class CreateMemoryRequest(BaseModel):
-    key: str = Field(..., description="Hierarchical key, e.g. 'architecture/database'")
-    content: str = Field(..., description="Text summary of the insight, decision, or preference")
+    key: Optional[str] = Field(None, description="Hierarchical key, e.g. 'profile/name', 'profile/assignment', 'architecture/database'")
+    content: Optional[str] = Field(None, description="Text summary of the insight, decision, or preference")
+    name: Optional[str] = Field(None, description="Shortcut for user's full name or preferred name")
+    role: Optional[str] = Field(None, description="Shortcut for user role or module assignment")
+    assignment: Optional[str] = Field(None, description="Shortcut for user module assignment")
     type: Optional[str] = Field("EPISODIC", description="SEMANTIC, EPISODIC, or PROCEDURAL")
     importance: Optional[float] = Field(0.5, description="Float importance between 0.0 and 1.0")
 
@@ -122,7 +127,10 @@ async def create_memory(
     response: Response,
     credentials = Depends(auth_middleware)
 ):
-    """Creates a new memory record and stores it in both Prisma and LangGraph Store."""
+    """
+    Creates or updates a persistent memory record in both Prisma and LangGraph Store.
+    Supports user identity shortcuts (name, role, assignment) and auto-slugifies keys.
+    """
     try:
         user_id = credentials.get("id") if credentials else None
         if not user_id:
@@ -130,23 +138,82 @@ async def create_memory(
             return {"success": False, "error": "Unauthorized"}
 
         m_type = MemoryType.EPISODIC
-        raw_type = body.type.upper().strip()
+        raw_type = (body.type or "EPISODIC").upper().strip()
         if raw_type in MemoryType.__members__:
             m_type = MemoryType[raw_type]
 
-        # 1. Create in Prisma
-        created = await prisma.memoryrecord.create(
-            data={
+        # Resolve final key and content with fallback for convenience shortcuts
+        final_key = (body.key or "").strip()
+        final_content = (body.content or "").strip()
+
+        if body.name and body.name.strip():
+            if not final_key:
+                final_key = "profile/name"
+            if not final_content:
+                final_content = f"User's name is {body.name.strip()}."
+            # Also sync fullName directly to User record
+            try:
+                await prisma.user.update(
+                    where={"id": user_id},
+                    data={"fullName": body.name.strip()}
+                )
+            except Exception as u_err:
+                logger.debug(f"User fullName update deferred: {u_err}")
+
+        elif body.assignment and body.assignment.strip():
+            if not final_key:
+                final_key = "profile/assignment"
+            if not final_content:
+                final_content = f"User is assigned to: {body.assignment.strip()}."
+
+        elif body.role and body.role.strip():
+            if not final_key:
+                final_key = "profile/assignment"
+            if not final_content:
+                final_content = f"User is assigned to: {body.role.strip()}."
+
+        if not final_content:
+            response.status_code = status.HTTP_400_BAD_REQUEST
+            return {"success": False, "error": "Content, name, or assignment is required to store a memory."}
+
+        if not final_key:
+            slug = re.sub(r'[^a-zA-Z0-9_\-]+', '_', final_content[:30].strip().lower()).strip('_')
+            final_key = f"custom/{slug}" if slug else "custom/note"
+
+        importance_val = clamp_to_unit_interval(body.importance if body.importance is not None else 0.5)
+
+        # 1. Upsert in Prisma MemoryRecord
+        existing = await prisma.memoryrecord.find_first(
+            where={
                 "userId": user_id,
                 "projectId": project_id,
-                "key": body.key.strip(),
-                "content": body.content.strip(),
-                "type": m_type,
-                "importance": clamp_to_unit_interval(body.importance if body.importance is not None else 0.5),
+                "key": final_key
             }
         )
 
-        # 2. Sync to LangGraph Store
+        if existing:
+            created = await prisma.memoryrecord.update(
+                where={"id": existing.id},
+                data={
+                    "content": final_content,
+                    "type": m_type,
+                    "importance": importance_val,
+                    "lastAccessed": datetime.now()
+                }
+            )
+        else:
+            created = await prisma.memoryrecord.create(
+                data={
+                    "userId": user_id,
+                    "projectId": project_id,
+                    "key": final_key,
+                    "content": final_content,
+                    "type": m_type,
+                    "importance": importance_val,
+                }
+            )
+
+        # 2. Sync to LangGraph Store across namespaces
         try:
             store = await get_memory_store()
             if store is not None:
