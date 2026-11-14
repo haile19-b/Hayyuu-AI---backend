@@ -6,6 +6,7 @@ followed by deterministic sensory pre-calibration (calibrate_action_signals).
 """
 
 from __future__ import annotations
+import asyncio
 import logging
 import re
 from typing import Dict, Any, List, Optional
@@ -111,96 +112,6 @@ def calibrate_action_signals(signals: MetaMoSignals) -> MetaMoSignals:
     return calibrated
 
 
-def _heuristic_fallback_signals(
-    user_query: str,
-    chat_history: Optional[List[Dict[str, Any]]] = None,
-    kg_context: str = "",
-    last_cognitive_state: Optional[Dict[str, Any]] = None,
-) -> MetaMoSignals:
-    """Deterministic fallback estimating signals from linguistic markers when LLM is offline or in local tests."""
-    q_clean = user_query.strip().lower()
-    words = set(re.findall(r"\b\w+\b", q_clean))
-    total_words = len(re.findall(r"\b\w+\b", user_query))
-
-    vague_terms = {
-        "something", "anything", "stuff", "thing", "fix it", "broken", "help",
-        "whatever", "improve", "better", "fix", "make it", "do it", "cool"
-    }
-    urgent_terms = {"asap", "urgent", "emergency", "critical", "blocking", "immediately", "right now"}
-    tech_terms = {"database", "postgres", "sql", "neo4j", "fastapi", "docker", "redis", "prisma", "asyncio", "mcp"}
-    plan_terms = {"task", "tasks", "breakdown", "plan", "decompose", "todo", "sprint", "milestone"}
-    conflict_terms = {"conflict", "conflicts", "contradiction", "discrepancy", "incompatible", "divergence"}
-    search_terms = {"search", "find", "lookup", "documentation", "docs", "where", "locate", "explore"}
-    greeting_terms = {"hi", "hello", "hey", "greetings", "thanks", "thank you", "ok", "okay"}
-
-    # Ambiguity: Short, vague queries trigger high ambiguity (Anti-Premature guard)
-    vague_count = sum(1 for t in vague_terms if t in q_clean)
-    is_short = total_words <= 5
-    amb_raw = 0.10
-    if is_short and vague_count > 0:
-        amb_raw += 0.65
-    elif is_short and not any(t in words for t in greeting_terms):
-        amb_raw += 0.55
-    amb_raw += min(0.50, vague_count * 0.25)
-    ambiguity = clamp_to_unit_interval(amb_raw)
-
-    # Urgency
-    urgent_count = sum(1 for t in urgent_terms if t in q_clean)
-    urgency = clamp_to_unit_interval(min(1.0, urgent_count * 0.40 + user_query.count("!") * 0.15))
-
-    # Complexity
-    tech_count = sum(1 for t in tech_terms if t in words)
-    has_code = "```" in user_query or "`" in user_query
-    cx = clamp_to_unit_interval(min(1.0, (total_words / 80.0) * 0.35 + (tech_count * 0.15) + (0.25 if has_code else 0.0)))
-
-    # Needs Evidence (search queries, doc references, repository inspection)
-    has_search = any(t in q_clean for t in search_terms)
-    evid_raw = 0.20 + (0.45 if has_search else 0.0) + (0.30 if tech_count > 0 else 0.0) + (0.25 if ("document" in q_clean or "doc" in q_clean or "file" in q_clean or "repo" in q_clean) else 0.0)
-    needs_external_evidence = clamp_to_unit_interval(evid_raw)
-
-    # Needs Task Plan
-    plan_count = sum(1 for t in plan_terms if t in q_clean)
-    needs_task_plan = clamp_to_unit_interval(min(1.0, plan_count * 0.45))
-
-    # Multi source
-    needs_multi_source = clamp_to_unit_interval(0.20 + (0.30 if ("compare" in q_clean or "synthesize" in q_clean) else 0.0))
-
-    # Verify Request (explicit conflict checking or verification)
-    verify_terms = {"verify", "verification", "conflict", "conflicts", "contradiction", "incompatible", "cross-check", "validate", "validating"}
-    verify_request = any(t in words for t in verify_terms) or "verify" in q_clean or "cross-check" in q_clean
-
-    # Valence
-    valence = 0.0
-    if any(t in words for t in ["thanks", "thank", "great", "awesome", "perfect", "good"]):
-        valence = 0.60
-    elif any(t in words for t in ["wrong", "bad", "error", "fail", "broken", "frustrated"]):
-        valence = -0.50
-
-    # User Expertise
-    prev_exp = float(last_cognitive_state.get("user_expertise", 0.50)) if last_cognitive_state else 0.50
-    if tech_count >= 2 or has_code:
-        user_exp = clamp_to_unit_interval(prev_exp + 0.05)
-    else:
-        user_exp = prev_exp
-
-    intent = "factual" if ("what" in words or "how" in words) else ("reflective" if ("why" in words or "explain" in words) else "mixed")
-
-    raw = MetaMoSignals(
-        cx=cx,
-        ambiguity=ambiguity,
-        needs_external_evidence=needs_external_evidence,
-        needs_task_plan=needs_task_plan,
-        needs_multi_source_integration=needs_multi_source,
-        valence=valence,
-        intent_type=intent,
-        reflective_intent=0.6 if intent == "reflective" else 0.4,
-        verify_request=verify_request,
-        user_expertise=user_exp,
-        urgency=urgency,
-    )
-    return calibrate_action_signals(raw)
-
-
 async def extract_signals(
     user_query: str,
     chat_history: Optional[List[Dict[str, Any]]] = None,
@@ -209,11 +120,11 @@ async def extract_signals(
     model_name: Optional[str] = None,
 ) -> MetaMoSignals:
     """
-    Extracts continuous perceptual signals using Gemini Flash with native Structured Outputs.
+    Extracts continuous perceptual signals strictly using Gemini with native Structured Outputs.
+    Iterates across candidate Gemini models to ensure resilient LLM extraction.
     Automatically applies sensory pre-calibration (calibrate_action_signals).
-    Gracefully falls back to deterministic estimation if the model call fails.
     """
-    model = model_name or (settings.GEMINI_MODELS[0] if getattr(settings, "GEMINI_MODELS", None) else "gemini-3.8-flash")
+    from app.core.ai_cascade import generate_content_cascade, get_candidate_models
 
     # Build transcript context snippet
     history_snippet = ""
@@ -235,24 +146,21 @@ async def extract_signals(
     )
 
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model,
+        response = await generate_content_cascade(
             contents=[prompt],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=MetaMoSignals,
                 temperature=0.0,
             ),
+            candidate_models=get_candidate_models(model_name),
+            timeout_seconds=10.0,
         )
-        if response.text:
+        if response and response.text:
             signals = MetaMoSignals.model_validate_json(response.text)
             return calibrate_action_signals(signals)
     except Exception as e:
-        logger.warning(f"LLM signal extraction fell back to deterministic heuristic ({e})")
+        logger.error(f"[MetaMo Signals] All candidate models failed: {e}. Using baseline calibrated signals.")
 
-    return _heuristic_fallback_signals(
-        user_query=user_query,
-        chat_history=chat_history,
-        kg_context=kg_context,
-        last_cognitive_state=last_cognitive_state,
-    )
+    prev_exp = float(last_cognitive_state.get("user_expertise", 0.50)) if last_cognitive_state else 0.50
+    return calibrate_action_signals(MetaMoSignals(user_expertise=prev_exp))
