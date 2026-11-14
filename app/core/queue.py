@@ -201,9 +201,10 @@ async def consolidate_memory_job(ctx, user_id: str, project_id: str, thread_id: 
         await ensure_db_connected()
         messages = await prisma.chatmessage.find_many(
             where={"threadId": thread_id},
-            order={"createdAt": "asc"},
+            order={"createdAt": "desc"},
             take=30
         )
+        messages.reverse()
         msg_dicts = [
             {"role": m.role.value if hasattr(m.role, "value") else str(m.role), "content": m.content}
             for m in messages
