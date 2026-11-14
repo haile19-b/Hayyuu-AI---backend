@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import asyncio
 from typing import Optional, List, Dict, Any, AsyncGenerator
 from pydantic import BaseModel, Field
 
@@ -18,7 +19,7 @@ from google.genai import types
 
 from app.core.config import genAI
 from app.core.env import settings
-from app.core.database import prisma, get_checkpointer, get_memory_store
+from app.core.database import prisma, ensure_db_connected, get_checkpointer, get_memory_store
 from app.middleware.auth_middleware import auth_middleware
 from app.domain.entities.auth.auth_schema import ApiResponse
 from prisma.enums import MessageRole
@@ -237,7 +238,9 @@ async def stream_chat_with_project(
         full_content_chunks: List[str] = []
 
         try:
-            # 1. Multi-tier Context & Memory Retrieval
+            # 1. Immediate status: Context & Memory Retrieval
+            yield f"event: status\ndata: {json.dumps({'status': 'retrieving_context', 'message': 'Retrieving project memory and context...'})}\n\n"
+
             memories = await retrieve_memories(user_id=user_id, project_id=project_id, query=body.prompt, limit=5)
             budgeted = await assemble_context_with_budget(
                 thread_id=thread.id,
@@ -259,7 +262,9 @@ async def stream_chat_with_project(
                     pass
             cog_state = cog_state_dict or CognitiveState().to_dict()
 
-            # 2. MetaMo Cognitive Deliberation
+            # 2. Status: MetaMo Cognitive Deliberation
+            yield f"event: status\ndata: {json.dumps({'status': 'deliberating', 'message': 'Analyzing query and selecting deliberation strategy...'})}\n\n"
+
             controller = MetaMoController()
             deliberation = await controller.deliberate(
                 user_query=body.prompt,
@@ -323,28 +328,64 @@ async def stream_chat_with_project(
                 episodic_memory_context=episodic_block
             ) + action_directive
 
-            # 6. Stream LLM Response via Gemini Async Streaming API
-            model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
-            try:
-                response_stream = await genAI.aio.models.generate_content_stream(
-                    model=model_name,
-                    contents=[body.prompt],
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.3,
-                    )
-                )
+            # 6. Stream LLM Response with Model Fallback Cascade & Timeout
+            yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Synthesizing response...'})}\n\n"
 
-                async for chunk in response_stream:
-                    if chunk.text:
-                        full_content_chunks.append(chunk.text)
-                        token_event = {"delta": chunk.text}
-                        yield f"event: token\ndata: {json.dumps(token_event)}\n\n"
-            except Exception as stream_err:
-                logger.warning(f"Async streaming fallback: {stream_err}")
-                fallback_msg = f"Response generated under {deliberation['style_modifier']}."
-                full_content_chunks.append(fallback_msg)
-                yield f"event: token\ndata: {json.dumps({'delta': fallback_msg})}\n\n"
+            models_to_try = list(settings.GEMINI_MODELS) if settings.GEMINI_MODELS else [
+                "gemini-3.8-flash",
+                "gemini-3.5-flash",
+                "gemini-4-argon",
+                "gemini-3.5-flash-lite",
+                "gemini-3.1-flash-lite",
+                "gemini-3.8-live",
+                "gemini-2.5-flash-lite",
+            ]
+            stream_success = False
+            last_stream_err = None
+
+            for model_name in models_to_try:
+                try:
+                    logger.info(f"Initiating stream with model: {model_name}")
+                    stream_coro = genAI.aio.models.generate_content_stream(
+                        model=model_name,
+                        contents=[body.prompt],
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            temperature=0.3,
+                        )
+                    )
+                    # Bounded with 45s connection timeout
+                    response_stream = await asyncio.wait_for(stream_coro, timeout=45.0)
+
+                    # Iterate chunks with per-chunk timeout
+                    stream_iter = response_stream.__aiter__()
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=45.0)
+                        except StopAsyncIteration:
+                            break
+                        if chunk.text:
+                            full_content_chunks.append(chunk.text)
+                            token_event = {"delta": chunk.text}
+                            yield f"event: token\ndata: {json.dumps(token_event)}\n\n"
+
+                    if full_content_chunks:
+                        stream_success = True
+                        break
+                except Exception as stream_err:
+                    last_stream_err = stream_err
+                    logger.warning(f"Streaming error with model {model_name}: {stream_err}")
+                    if full_content_chunks:
+                        # Some chunks were already yielded, avoid duplicate text
+                        stream_success = True
+                        break
+                    yield f"event: status\ndata: {json.dumps({'status': 'retrying', 'message': f'Model {model_name} busy, trying backup model...'})}\n\n"
+
+            if not stream_success:
+                logger.error(f"All Gemini models failed to stream content: {last_stream_err}")
+                error_msg = f"Unable to stream response from AI model ({last_stream_err}). Please retry."
+                yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
+                return
 
             full_response = "".join(full_content_chunks)
 
@@ -355,6 +396,9 @@ async def stream_chat_with_project(
                 decision={"action": deliberation["action"], "style_modifier": deliberation["style_modifier"]},
                 turn_success=True
             )
+
+            # Re-ensure PostgreSQL connection is active before persisting
+            await ensure_db_connected()
 
             # Persist thread state and assistant message (zero DB bloat: no telemetry in ChatMessage)
             await prisma.conversationthread.update(
