@@ -78,6 +78,7 @@ class ThreadSummary(BaseModel):
 
 async def _get_or_create_thread(project_id: str, user_id: str, thread_id: Optional[str], initial_prompt: str):
     """Retrieves an existing ConversationThread or creates a new initialized one."""
+    await ensure_db_connected()
     if thread_id:
         existing = await prisma.conversationthread.find_unique(where={"id": thread_id})
         if existing and existing.projectId == project_id and existing.userId == user_id:
@@ -99,6 +100,7 @@ async def _get_or_create_thread(project_id: str, user_id: str, thread_id: Option
 
 async def _save_user_message(thread_id: str, content: str):
     """Creates a user message and queues vector embedding creation."""
+    await ensure_db_connected()
     msg = await prisma.chatmessage.create(
         data={
             "threadId": thread_id,
@@ -137,6 +139,7 @@ async def chat_with_project(
     Persists checkpoints to LangGraph AsyncPostgresSaver and episodic memory to Store.
     """
     try:
+        await ensure_db_connected()
         user_id = credentials.get("id") if credentials else None
         if not user_id:
             response.status_code = status.HTTP_401_UNAUTHORIZED
@@ -165,12 +168,25 @@ async def chat_with_project(
         supervisor_graph = await get_compiled_supervisor()
         config = {"configurable": {"thread_id": thread.id}}
 
+        user_profile = None
+        try:
+            user_rec = await prisma.user.find_unique(where={"id": user_id})
+            if user_rec:
+                user_profile = {
+                    "fullName": user_rec.fullName,
+                    "userName": user_rec.userName,
+                    "email": user_rec.email,
+                }
+        except Exception:
+            pass
+
         initial_state: SupervisorState = {
             "messages": [],
             "thread_id": thread.id,
             "project_id": project_id,
             "user_id": user_id,
             "user_query": body.prompt,
+            "user_profile": user_profile,
             "cognitive_state": cog_state_dict or CognitiveState().to_dict(),
             "current_signals": {},
             "deliberation_action": "",
@@ -189,6 +205,13 @@ async def chat_with_project(
         }
 
         result = await supervisor_graph.ainvoke(initial_state, config=config)
+
+        # Trigger autonomous background episodic memory consolidation
+        try:
+            from app.core.queue import enqueue_memory_consolidation
+            await enqueue_memory_consolidation(user_id=user_id, project_id=project_id, thread_id=thread.id)
+        except Exception as q_err:
+            logger.debug(f"Memory consolidation trigger deferred: {q_err}")
 
         resp_data = ChatResponseData(
             answer=result.get("final_response", ""),
@@ -215,6 +238,7 @@ async def chat_with_project(
 async def stream_chat_with_project(
     project_id: str,
     body: ChatRequest,
+    request: Request,
     credentials = Depends(auth_middleware)
 ):
     """
@@ -222,11 +246,15 @@ async def stream_chat_with_project(
     Emits metadata, token deltas, and completion events.
     Deliberation telemetry is logged out-of-band to CSV/JSONL for developers.
     """
+    await ensure_db_connected()
     user_id = credentials.get("id") if credentials else None
     if not user_id:
         return Response("Unauthorized", status_code=status.HTTP_401_UNAUTHORIZED)
 
-    project = await prisma.project.find_unique(where={"id": project_id})
+    project = await prisma.project.find_unique(
+        where={"id": project_id},
+        include={"repositories": True, "documents": True}
+    )
     if not project or project.userId != user_id:
         return Response("Unauthorized", status_code=status.HTTP_403_FORBIDDEN)
 
@@ -241,7 +269,8 @@ async def stream_chat_with_project(
             # 1. Immediate status: Context & Memory Retrieval
             yield f"event: status\ndata: {json.dumps({'status': 'retrieving_context', 'message': 'Retrieving project memory and context...'})}\n\n"
 
-            memories = await retrieve_memories(user_id=user_id, project_id=project_id, query=body.prompt, limit=5)
+            await ensure_db_connected()
+            memories = await retrieve_memories(user_id=user_id, project_id=project_id, query=body.prompt, limit=10)
             budgeted = await assemble_context_with_budget(
                 thread_id=thread.id,
                 project_id=project_id,
@@ -319,71 +348,119 @@ async def stream_chat_with_project(
             elif action_key == "act_synthesize":
                 action_directive = "\n\nACTION: Synthesize complex requirements, architectural components, and data flows."
 
+            user_profile_text = ""
+            try:
+                user_rec = await prisma.user.find_unique(where={"id": user_id})
+                if user_rec:
+                    user_profile_text = f"<user_profile>\nUser's Full Name: {user_rec.fullName}\nUsername: {user_rec.userName}\nEmail: {user_rec.email}\n</user_profile>"
+            except Exception:
+                pass
+
             mem_formatted = format_memories_for_prompt(memories) if memories else ""
             episodic_block = f"Long-Term User Preferences & Decisions:\n{mem_formatted}" if mem_formatted else ""
 
             system_instruction = SYSTEM_BASE_PROMPT.format(
+                user_profile_context=user_profile_text,
                 style_directive=style_directive,
                 domain_context=f"Domain Context:\n{kg_text}" if kg_text else "",
                 episodic_memory_context=episodic_block
             ) + action_directive
 
-            # 6. Stream LLM Response with Model Fallback Cascade & Timeout
+            # Format multi-turn conversational context for Gemini
+            from app.agents.supervisor.context_budget import format_history_for_genai
+            tier1 = budgeted.get("tier1_chat_history", [])
+            gemini_contents = format_history_for_genai(tier1, body.prompt)
+
+            # 5.5 Autonomous Dynamic Tool Execution via MCP Client
+            from app.infrastructure.mcp.client_manager import MCPClientManager
+            from app.core.ai_cascade import generate_content_cascade, generate_content_stream_cascade
+
+            mcp_mgr = getattr(request.app.state, "mcp_manager", None) or MCPClientManager.get_instance()
+            gemini_tools = mcp_mgr.get_gemini_tools() if mcp_mgr else None
+
+            # Detect if turn warrants dynamic repository or database tool queries
+            q_lower = body.prompt.lower()
+            tool_keywords = (
+                "issue", "pr", "pull request", "repo", "repository", "github", "git",
+                "branch", "commit", "code", "file", "diff", "task", "requirement",
+                "conflict", "database", "neo4j", "subgraph"
+            )
+            needs_tools = (
+                action_key in ("act_search", "act_verify", "act_synthesize", "act_analyze_conflict")
+                or any(kw in q_lower for kw in tool_keywords)
+            )
+
+            if needs_tools and gemini_tools and mcp_mgr:
+                try:
+                    tool_config = types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        tools=gemini_tools,
+                        temperature=0.0
+                    )
+                    pre_flight = await generate_content_cascade(
+                        contents=gemini_contents,
+                        config=tool_config,
+                        timeout_seconds=20.0
+                    )
+                    if pre_flight and pre_flight.function_calls:
+                        for call in pre_flight.function_calls:
+                            yield f"event: status\ndata: {json.dumps({'status': 'executing_tool', 'message': f'Executing {call.name}...'})}\n\n"
+                            call_args = dict(call.args) if call.args else {}
+                            if "project_id" not in call_args:
+                                call_args["project_id"] = project_id
+
+                            # Auto-fill repo if not provided and project has connected repositories
+                            if "repo" not in call_args or not call_args.get("repo"):
+                                if getattr(project, "repositories", None):
+                                    call_args["repo"] = project.repositories[0].fullName
+
+                            tool_output = await mcp_mgr.call_tool(call.name, call_args)
+
+                            if pre_flight.candidates:
+                                gemini_contents.append(pre_flight.candidates[0].content)
+                            gemini_contents.append(
+                                types.Content(
+                                    role="user",
+                                    parts=[types.Part.from_function_response(name=call.name, response={"result": str(tool_output)})]
+                                )
+                            )
+                except Exception as tool_err:
+                    logger.warning(f"MCP tool dynamic execution bypassed: {tool_err}")
+
+            # 6. Stream LLM Response with Model Fallback Cascade & Strict Latency Bounds
             yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Synthesizing response...'})}\n\n"
 
-            models_to_try = list(settings.GEMINI_MODELS) if settings.GEMINI_MODELS else [
-                "gemini-3.8-flash",
-                "gemini-3.5-flash",
-                "gemini-4-argon",
-                "gemini-3.5-flash-lite",
-                "gemini-3.1-flash-lite",
-                "gemini-3.8-live",
-                "gemini-2.5-flash-lite",
-            ]
             stream_success = False
-            last_stream_err = None
+            last_stream_err: Optional[Exception] = None
 
-            for model_name in models_to_try:
-                try:
-                    logger.info(f"Initiating stream with model: {model_name}")
-                    stream_coro = genAI.aio.models.generate_content_stream(
-                        model=model_name,
-                        contents=[body.prompt],
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            temperature=0.3,
-                        )
-                    )
-                    # Bounded with 45s connection timeout
-                    response_stream = await asyncio.wait_for(stream_coro, timeout=45.0)
+            try:
+                gen_config = types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    temperature=0.3,
+                )
+                async for chunk, active_model in generate_content_stream_cascade(
+                    contents=gemini_contents,
+                    config=gen_config,
+                    timeout_first_chunk=25.0,
+                ):
+                    chunk_text = getattr(chunk, "text", None)
+                    if chunk_text:
+                        full_content_chunks.append(chunk_text)
+                        token_event = {"delta": chunk_text}
+                        yield f"event: token\ndata: {json.dumps(token_event)}\n\n"
 
-                    # Iterate chunks with per-chunk timeout
-                    stream_iter = response_stream.__aiter__()
-                    while True:
-                        try:
-                            chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=45.0)
-                        except StopAsyncIteration:
-                            break
-                        if chunk.text:
-                            full_content_chunks.append(chunk.text)
-                            token_event = {"delta": chunk.text}
-                            yield f"event: token\ndata: {json.dumps(token_event)}\n\n"
-
-                    if full_content_chunks:
-                        stream_success = True
-                        break
-                except Exception as stream_err:
-                    last_stream_err = stream_err
-                    logger.warning(f"Streaming error with model {model_name}: {stream_err}")
-                    if full_content_chunks:
-                        # Some chunks were already yielded, avoid duplicate text
-                        stream_success = True
-                        break
-                    yield f"event: status\ndata: {json.dumps({'status': 'retrying', 'message': f'Model {model_name} busy, trying backup model...'})}\n\n"
+                if full_content_chunks:
+                    stream_success = True
+            except Exception as stream_err:
+                last_stream_err = stream_err
+                logger.error(f"Streaming error in chat route: {stream_err}")
+                if full_content_chunks:
+                    # Partial stream succeeded, do not overwrite with error
+                    stream_success = True
 
             if not stream_success:
-                logger.error(f"All Gemini models failed to stream content: {last_stream_err}")
-                error_msg = f"Unable to stream response from AI model ({last_stream_err}). Please retry."
+                logger.error(f"All candidate Gemini models failed to stream content: {last_stream_err}")
+                error_msg = "The AI service is currently experiencing high demand. Please try again in a few moments."
                 yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
                 return
 
@@ -398,41 +475,66 @@ async def stream_chat_with_project(
             )
 
             # Re-ensure PostgreSQL connection is active before persisting
-            await ensure_db_connected()
-
-            # Persist thread state and assistant message (zero DB bloat: no telemetry in ChatMessage)
-            await prisma.conversationthread.update(
-                where={"id": thread.id},
-                data={"cognitiveState": json.dumps(updated_cog_state)}
-            )
-
-            created_msg = await prisma.chatmessage.create(
-                data={
-                    "threadId": thread.id,
-                    "role": MessageRole.ASSISTANT,
-                    "content": full_response,
-                    "cognitiveAction": deliberation["action"],
-                    "styleModifier": deliberation["style_modifier"],
-                }
-            )
-
-            # Generate embedding in background
+            created_msg_id = None
             try:
-                from app.infrastructure.ai.gemini_embedder import GeminiEmbedder
-                embedder = GeminiEmbedder()
-                vec = embedder.embed_text(full_response, user_query=False)
-                vec_lit = "[" + ",".join(str(x) for x in vec) + "]"
-                await prisma.execute_raw(
-                    f'UPDATE chat_messages SET embedding = \'{vec_lit}\'::vector WHERE id = $1;',
-                    created_msg.id
-                )
-            except Exception:
-                pass
+                await ensure_db_connected()
 
-            # 8. Emit SSE Completion Event
+                # Persist thread state and assistant message (zero DB bloat: no telemetry in ChatMessage)
+                await prisma.conversationthread.update(
+                    where={"id": thread.id},
+                    data={"cognitiveState": json.dumps(updated_cog_state)}
+                )
+
+                created_msg = await prisma.chatmessage.create(
+                    data={
+                        "threadId": thread.id,
+                        "role": MessageRole.ASSISTANT,
+                        "content": full_response,
+                        "cognitiveAction": deliberation["action"],
+                        "styleModifier": deliberation["style_modifier"],
+                    }
+                )
+                created_msg_id = created_msg.id
+
+                # Generate embedding in background
+                try:
+                    from app.infrastructure.ai.gemini_embedder import GeminiEmbedder
+                    embedder = GeminiEmbedder()
+                    vec = embedder.embed_text(full_response, user_query=False)
+                    vec_lit = "[" + ",".join(str(x) for x in vec) + "]"
+                    await prisma.execute_raw(
+                        f'UPDATE chat_messages SET embedding = \'{vec_lit}\'::vector WHERE id = $1;',
+                        created_msg.id
+                    )
+                except Exception:
+                    pass
+
+            except Exception as persist_err:
+                logger.warning(f"Message persistence warning: {persist_err}. Reconnecting database...")
+                try:
+                    await ensure_db_connected()
+                    await prisma.conversationthread.update(
+                        where={"id": thread.id},
+                        data={"cognitiveState": json.dumps(updated_cog_state)}
+                    )
+                except Exception:
+                    pass
+
+            # 8. Trigger autonomous background episodic memory consolidation
+            try:
+                from app.core.queue import enqueue_memory_consolidation
+                await enqueue_memory_consolidation(
+                    user_id=user_id,
+                    project_id=project_id,
+                    thread_id=thread.id
+                )
+            except Exception as q_err:
+                logger.debug(f"Memory consolidation trigger deferred: {q_err}")
+
+            # 9. Emit SSE Completion Event
             complete_event = {
                 "thread_id": thread.id,
-                "message_id": created_msg.id,
+                "message_id": created_msg_id,
                 "turn": updated_cog_state.get("turn_count", 1),
                 "status": "completed"
             }
