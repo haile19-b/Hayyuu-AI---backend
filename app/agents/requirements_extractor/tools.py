@@ -56,8 +56,12 @@ def clean_json_response(raw: str) -> str:
 
     return text
 
+
 def _is_transient_error(e: Exception) -> bool:
     """Check if an exception represents a temporary, retryable server-side capacity/rate-limit error."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        return True
+
     err_str = str(e).lower()
     
     # Check for HTTP status codes / errors from Google GenAI SDK
@@ -79,6 +83,7 @@ def _is_transient_error(e: Exception) -> bool:
         "temporarily unavailable",
         "connection reset",
         "timed out",
+        "timeout",
     ]
     return any(indicator in err_str for indicator in transient_indicators)
 
@@ -91,18 +96,23 @@ async def call_gemini_with_fallback(
     temperature: float = 0.2,
     max_retries_per_model: int = 2,
     base_delay: float = 2.0,
+    request_timeout: float = 90.0,
 ) -> str:
     """
     Executes a structured Gemini interaction with:
     1. Automatic model fallback cascade from settings.GEMINI_MODELS (primary -> secondary -> tertiary).
-    2. Exponential backoff with jitter on transient errors (503 High Demand, 429 Rate Limits, 500 Server Errors).
-    3. Real-time progress updates published to Redis via publish_progress.
+    2. Strict asyncio.wait_for timeout bounding on every network call.
+    3. Exponential backoff with jitter on transient errors (503 High Demand, 429 Rate Limits, Timeouts).
+    4. Real-time progress updates published to Redis via publish_progress.
     """
     models = settings.GEMINI_MODELS if settings.GEMINI_MODELS else [
         "gemini-3.8-flash",
-        "gemini-3.7-flash",
         "gemini-3.5-flash",
-        "gemini-2.5-flash",
+        "gemini-4-argon",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.8-live",
+        "gemini-2.5-flash-lite",
     ]
     last_error: Optional[Exception] = None
     
@@ -118,8 +128,8 @@ async def call_gemini_with_fallback(
             
         for attempt in range(1, max_retries_per_model + 1):
             try:
-                logger.info(f"Invoking model '{model_name}' (attempt {attempt}/{max_retries_per_model}) for doc={doc_id}")
-                response = await genAI.aio.interactions.create(
+                logger.info(f"Invoking model '{model_name}' (attempt {attempt}/{max_retries_per_model}, timeout={request_timeout}s) for doc={doc_id}")
+                create_coro = genAI.aio.interactions.create(
                     model=model_name,
                     input=input_contents,
                     response_format={
@@ -128,6 +138,7 @@ async def call_gemini_with_fallback(
                         "schema": response_schema.model_json_schema()
                     }
                 )
+                response = await asyncio.wait_for(create_coro, timeout=request_timeout)
                 output_raw = getattr(response, "output_text", None) or getattr(response, "text", "")
                 return clean_json_response(output_raw)
             except Exception as e:

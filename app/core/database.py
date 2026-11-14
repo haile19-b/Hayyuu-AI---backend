@@ -36,7 +36,16 @@ async def get_pg_pool() -> AsyncConnectionPool:
             conninfo=dsn,
             min_size=1,
             max_size=10,
-            kwargs={"autocommit": True},
+            kwargs={
+                "autocommit": True,
+                "keepalives": 1,
+                "keepalives_idle": 15,
+                "keepalives_interval": 5,
+                "keepalives_count": 3,
+            },
+            check=AsyncConnectionPool.check_connection,
+            max_idle=60.0,
+            max_lifetime=600.0,
             open=False,
         )
         await _pg_pool.open()
@@ -132,6 +141,16 @@ async def ensure_db_connected() -> None:
         except Exception:
             pass
         await connect_db()
+
+    # Also verify the psycopg pool for LangGraph is initialized and open
+    global _pg_pool, _checkpointer, _memory_store
+    if _pg_pool is None or getattr(_pg_pool, "_closed", False):
+        _pg_pool = None
+        _checkpointer = None
+        _memory_store = None
+        await get_pg_pool()
+        await get_checkpointer()
+        await get_memory_store()
 
 
 # FastAPI Dependency Injection

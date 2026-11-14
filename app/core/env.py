@@ -12,7 +12,20 @@ class Settings(BaseSettings):
     
     REDIS_URL: str = "redis://localhost:6379/0"
     GEMINI_API_KEY: str | None = None
-    GEMINI_MODELS: list[str] = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    GEMINI_MODELS: list[str] = [
+        # Flagship / Workhorse Production Models
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        # Frontier & Advanced Reasoning
+        "gemini-4-argon",
+        # Cost & Latency Optimized (Lite)
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        # Live & Real-Time Orchestration
+        "gemini-3.8-live",
+        # Legacy / Active Transition (Limited API Access)
+        "gemini-2.5-flash-lite",
+    ]
     MAX_FORM_SIZE_MB: int = 50
     ENABLE_EMBEDDED_WORKER: bool = False
     

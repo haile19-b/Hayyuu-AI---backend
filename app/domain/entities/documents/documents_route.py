@@ -133,6 +133,7 @@ async def retry_document_analysis(
     credentials = Depends(auth_middleware)
 ):
     """Resume a failed document analysis pipeline from the last completed node checkpoint."""
+    logger.info(f"Triggering document analysis retry for document {documentId} in project {projectId}")
     try:
         user_id = credentials.get("id") if credentials else None
         if not user_id:
@@ -151,10 +152,12 @@ async def retry_document_analysis(
             data={"status": DocumentStatus.PENDING}
         )
         
-        # 3. Enqueue the analysis job.
+        # 3. Enqueue the analysis job with force=True to flush previous job state from Redis
         # The LangGraph execution function (run_workflow) will automatically look up
         # the thread ID (document ID) checkpoint and resume from where it stopped.
-        await queue.enqueue_document_analysis(documentId, projectId)
+        enqueued = await queue.enqueue_document_analysis(documentId, projectId, force=True)
+        if not enqueued:
+            logger.warning(f"Document analysis job for {documentId} could not be enqueued to Redis.")
         
         return {"success": True, "response": None}
     except Exception as e:

@@ -2,7 +2,7 @@ import logging
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from app.core.env import settings
-from app.core.database import prisma, ensure_db_connected
+from app.core.database import prisma, ensure_db_connected, get_checkpointer
 from app.core.progress import publish_progress
 from prisma.enums import DocumentStatus
 
@@ -33,75 +33,77 @@ async def run_workflow(document_id: str, project_id: str) -> None:
     """Run the compiled LangGraph document analysis pipeline, enabling automatic resume."""
     logger.info(f"Running LangGraph workflow for document {document_id}")
     
-    # Initialize connection to PostgreSQL for state checkpoints
-    async with AsyncPostgresSaver.from_conn_string(settings.clean_postgres_dsn) as checkpointer:
-        # Compile graph with checkpointing
-        graph = builder.compile(checkpointer=checkpointer)
+    # Use resilient shared connection pool with keepalive and health checks
+    await ensure_db_connected()
+    checkpointer = await get_checkpointer()
+    
+    # Compile graph with pooled checkpointer
+    graph = builder.compile(checkpointer=checkpointer)
+    
+    # Use document ID as thread ID to guarantee identical thread recovery
+    config = {"configurable": {"thread_id": document_id}}
+    
+    # Check if there is an existing state checkpoint to resume from
+    state = await graph.aget_state(config)
+    final_state = None
+    if state and state.next:
+        logger.info(f"Resuming document analysis workflow for {document_id} from node: {state.next}")
+        final_state = await graph.ainvoke(None, config=config)
+    elif state and not state.next and state.values:
+        logger.info(f"Document analysis workflow already completed for {document_id}. Skipping requirements extraction.")
+        final_state = state.values
+    else:
+        logger.info(f"Starting new document analysis workflow execution for {document_id}")
+        initial_state = {
+            "project_id": project_id,
+            "document_id": document_id
+        }
+        final_state = await graph.ainvoke(initial_state, config=config)
         
-        # Use document ID as thread ID to guarantee identical thread recovery
-        config = {"configurable": {"thread_id": document_id}}
-        
-        # Check if there is an existing state checkpoint to resume from
-        state = await graph.aget_state(config)
-        final_state = None
-        if state and state.next:
-            logger.info(f"Resuming document analysis workflow for {document_id} from node: {state.next}")
-            final_state = await graph.ainvoke(None, config=config)
-        elif state and not state.next and state.values:
-            logger.info(f"Document analysis workflow already completed for {document_id}. Skipping requirements extraction.")
-            final_state = state.values
-        else:
-            logger.info(f"Starting new document analysis workflow execution for {document_id}")
-            initial_state = {
-                "project_id": project_id,
-                "document_id": document_id
-            }
-            final_state = await graph.ainvoke(initial_state, config=config)
-            
-        if not isinstance(final_state, dict):
-            final_state = {}
+    if not isinstance(final_state, dict):
+        final_state = {}
 
-        # 1. Resolve document filename and Gemini file URIs directly from completed workflow state
-        gemini_file_uri = final_state.get("gemini_file_uri")
-        gemini_file_mime_type = final_state.get("gemini_file_mime_type")
-        filename = final_state.get("document_name")
-        if not filename:
-            document = await prisma.document.find_unique(where={"id": document_id})
-            filename = document.name if document else "document"
+    # 1. Resolve document filename and Gemini file URIs directly from completed workflow state
+    gemini_file_uri = final_state.get("gemini_file_uri")
+    gemini_file_mime_type = final_state.get("gemini_file_mime_type")
+    filename = final_state.get("document_name")
+    if not filename:
+        document = await prisma.document.find_unique(where={"id": document_id})
+        filename = document.name if document else "document"
 
-        # 2. Inform client of pipeline transition to knowledge builder
-        await publish_progress(
-            document_id=document_id,
-            message="Requirements extraction complete. Initializing knowledge base construction...",
-            step="transition",
-            status="PROCESSING"
-        )
+    # 2. Inform client of pipeline transition to knowledge builder
+    await publish_progress(
+        document_id=document_id,
+        message="Requirements extraction complete. Initializing knowledge base construction...",
+        step="transition",
+        status="PROCESSING"
+    )
 
-        # 3. Trigger Agent Knowledge Builder to build PGVector and Neo4j indices
-        logger.info(f"Triggering Agent Knowledge Builder for document {document_id}")
-        await publish_progress(document_id, "Building knowledge graph and vector indices...", "knowledge_builder")
+    # 3. Trigger Agent Knowledge Builder to build PGVector and Neo4j indices
+    logger.info(f"Triggering Agent Knowledge Builder for document {document_id}")
+    await publish_progress(document_id, "Building knowledge graph and vector indices...", "knowledge_builder")
+    
+    kb_state = KnowledgeBuilderState(
+        project_id=project_id,
+        document_id=document_id,
+        filename=filename,
+        gemini_file_uri=gemini_file_uri,
+        gemini_file_mime_type=gemini_file_mime_type,
+    )
+    await run_knowledge_builder(kb_state)
         
-        kb_state = KnowledgeBuilderState(
-            project_id=project_id,
-            document_id=document_id,
-            filename=filename,
-            gemini_file_uri=gemini_file_uri,
-            gemini_file_mime_type=gemini_file_mime_type,
-        )
-        await run_knowledge_builder(kb_state)
-            
-        # Update document status in the database to INDEXED upon successful completion
-        await ensure_db_connected()
-        await prisma.document.update(
-            where={"id": document_id},
-            data={"status": DocumentStatus.INDEXED}
-        )
-        
-        # Publish final progress completion status
-        await publish_progress(
-            document_id=document_id,
-            message="Document analysis pipeline completed successfully!",
-            step="finished",
-            status="COMPLETED"
-        )
+    # Update document status in the database to INDEXED upon successful completion
+    await ensure_db_connected()
+    await prisma.document.update(
+        where={"id": document_id},
+        data={"status": DocumentStatus.INDEXED}
+    )
+    
+    # Publish final progress completion status
+    await publish_progress(
+        document_id=document_id,
+        message="Document analysis pipeline completed successfully!",
+        step="finished",
+        status="COMPLETED"
+    )
 

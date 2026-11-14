@@ -6,7 +6,7 @@ from google.genai import types
 import anyio
 
 from app.core.config import genAI
-from app.core.database import prisma
+from app.core.database import prisma, ensure_db_connected
 from app.core.storage import storage_utility
 from app.core.progress import publish_progress
 from app.core.text_extractor import extract_text, extract_docling_document
@@ -57,6 +57,7 @@ async def preprocess_chunk_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         
         logger.info(f"[Node: preprocess_chunk] Downloading document '{doc_id}' to extract plain text...")
         try:
+            await ensure_db_connected()
             document = await prisma.document.find_unique(where={"id": doc_id})
             if not document:
                 raise ValueError(f"Document with ID {doc_id} not found.")
@@ -128,6 +129,13 @@ async def generate_embeddings_node(state: KnowledgeBuilderState) -> Dict[str, An
     if not chunks:
         return {}
 
+    # Check if embeddings are already present in state
+    if all(c.embedding is not None and len(c.embedding) > 0 for c in chunks):
+        logger.info(f"[Node: generate_embeddings] Embeddings already present for all {len(chunks)} chunks. Skipping computation.")
+        if doc_id:
+            await publish_progress(doc_id, f"Reusing {len(chunks)} existing pre-computed vector embeddings.", "embed")
+        return {"chunks": chunks}
+
     try:
         logger.info(f"[Node: generate_embeddings] Generating embeddings for {len(chunks)} chunks...")
         if doc_id:
@@ -156,6 +164,13 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     """
     project_id = state.project_id
     doc_id = state.document_id
+
+    # 0. Check if graph was already extracted in state
+    if state.extracted_graph and state.extracted_graph.nodes:
+        logger.info(f"[Node: extract_graph] Graph already extracted in state ({len(state.extracted_graph.nodes)} nodes). Skipping LLM re-extraction.")
+        if doc_id:
+            await publish_progress(doc_id, f"Reusing {len(state.extracted_graph.nodes)} extracted entities from state.", "extract")
+        return {"extracted_graph": state.extracted_graph}
 
     # Segment raw text with chunk index boundaries for source chunk tracking
     chunks_text_list = []
@@ -618,4 +633,24 @@ async def save_results_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
             f"Knowledge base indexing complete: {state.total_vectors_stored or 0} vector chunks and {state.total_nodes_stored or 0} graph elements indexed.",
             "save_results",
         )
+        # Persist completion marker in DB to guarantee idempotency across retries
+        try:
+            from prisma import Json
+            from prisma.enums import SuggestionStatus
+            await ensure_db_connected()
+            await prisma.aisuggestion.create(
+                data={
+                    "projectId": state.project_id,
+                    "type": "doc_kb_indexed",
+                    "content": Json({
+                        "documentId": doc_id,
+                        "vectors_stored": state.total_vectors_stored or 0,
+                        "nodes_stored": state.total_nodes_stored or 0,
+                    }),
+                    "status": SuggestionStatus.ACCEPTED
+                }
+            )
+        except Exception as m_err:
+            logger.debug(f"Non-fatal KB marker write: {m_err}")
+
     return {"status": "completed"}

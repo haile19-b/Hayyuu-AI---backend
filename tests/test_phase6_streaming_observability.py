@@ -215,6 +215,7 @@ async def test_stream_chat_with_project_event_lifecycle(tmp_path):
          patch("app.interfaces.api.v1.chat_route.assemble_context_with_budget", new=AsyncMock(return_value={"tier1_chat_history": [], "kg_context": ""})), \
          patch("app.interfaces.api.v1.chat_route.MetaMoController", return_value=mock_controller), \
          patch("app.interfaces.api.v1.chat_route.genAI.aio.models.generate_content_stream", new=AsyncMock(return_value=mock_chunk_generator())), \
+         patch("app.infrastructure.ai.gemini_embedder.GeminiEmbedder.embed_text", return_value=[0.1] * 768), \
          patch("app.interfaces.api.v1.chat_route.RunLogger") as mock_logger_cls:
 
         mock_logger_inst = MagicMock()
