@@ -402,14 +402,15 @@ Synthesized Answer:
         gemini_tools = [types.Tool(function_declarations=declarations)]
 
     try:
-        response = genAI.models.generate_content(
-            model="gemini-3.8-flash",
+        from app.core.ai_cascade import generate_content_cascade
+        response = await generate_content_cascade(
             contents=history,
             config=types.GenerateContentConfig(
                 tools=gemini_tools,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 temperature=0.0
-            )
+            ),
+            timeout_seconds=30.0,
         )
         
         # Check if the model requested function calls
