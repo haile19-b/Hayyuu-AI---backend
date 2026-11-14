@@ -3,7 +3,10 @@ from app.core.database import prisma
 from app.core.storage import storage_utility
 from app.domain.entities.projects.projects_service import ProjectsService
 from prisma.enums import DocumentStatus
-from app.core.queue import enqueue_document_analysis
+from app.core.queue import enqueue_document_analysis, abort_document_analysis
+import logging
+
+logger = logging.getLogger("uvicorn.error")
 
 class DocumentsService:
     @staticmethod
@@ -145,7 +148,21 @@ class DocumentsService:
             if not document or document.projectId != project_id:
                 return {"success": False, "error": "Document not found"}
 
-            # Delete file from R2 / S3
+            # 1. Abort any active or scheduled background ARQ job for this document
+            try:
+                await abort_document_analysis(document_id)
+            except Exception as arq_err:
+                logger.debug(f"Non-fatal ARQ job abort error: {arq_err}")
+
+            # 2. Clean up dangling LangGraph checkpointer entries to prevent restart resume
+            try:
+                await prisma.execute_raw("DELETE FROM checkpoints WHERE thread_id = $1;", document_id)
+                await prisma.execute_raw("DELETE FROM checkpoint_writes WHERE thread_id = $1;", document_id)
+                await prisma.execute_raw("DELETE FROM checkpoint_blobs WHERE thread_id = $1;", document_id)
+            except Exception as cp_err:
+                logger.debug(f"Non-fatal checkpointer cleanup error: {cp_err}")
+
+            # 3. Delete file from R2 / S3
             try:
                 await storage_utility.delete_file(document.filePath)
             except Exception as s3_err:
