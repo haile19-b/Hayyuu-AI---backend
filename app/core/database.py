@@ -71,12 +71,12 @@ async def get_memory_store() -> AsyncPostgresStore:
     return _memory_store
 
 
-async def connect_db(max_retries: int = 4, delay_seconds: float = 3.0) -> None:
-    """Connect to database with retry logic and extended timeout for serverless Neon cold-starts."""
+async def connect_db(max_retries: int = 3, delay_seconds: float = 1.5) -> None:
+    """Connect to database with retry logic and bounded timeout for serverless Neon cold-starts."""
     if not prisma.is_connected():
         for attempt in range(1, max_retries + 1):
             try:
-                await prisma.connect(timeout=30)
+                await prisma.connect(timeout=20)
                 logger.info("✅ Database Connected Successfully (Prisma)")
                 break
             except (PrismaError, Exception) as e:
@@ -137,9 +137,11 @@ async def ensure_db_connected() -> None:
     except Exception as e:
         logger.warning(f"Database connection health check failed ({e}). Reconnecting...")
         try:
-            await prisma.disconnect()
+            if prisma.is_connected():
+                await prisma.disconnect()
         except Exception:
             pass
+        await asyncio.sleep(0.1)
         await connect_db()
 
     # Also verify the psycopg pool for LangGraph is initialized and open
