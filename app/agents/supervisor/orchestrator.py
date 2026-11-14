@@ -22,12 +22,13 @@ from app.core.database import prisma, get_checkpointer, get_memory_store
 from prisma.enums import MessageRole
 
 from app.agents.supervisor.state import SupervisorState
-from app.agents.supervisor.context_budget import assemble_context_with_budget
+from app.agents.supervisor.context_budget import assemble_context_with_budget, format_history_for_genai
 from app.agents.supervisor.metamo.shared import CognitiveState
 from app.agents.supervisor.metamo.controller import MetaMoController
 from app.agents.supervisor.metamo.homeostasis import post_turn_update
 from app.agents.supervisor.metamo.eval_logger import RunLogger
 from app.agents.memory.retriever import retrieve_memories, format_memories_for_prompt
+from app.core.ai_cascade import generate_content_cascade
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -43,11 +44,19 @@ STYLE_PROMPTS = {
 SYSTEM_BASE_PROMPT = """You are Hayyuu AI, an advanced AI software engineering pair programmer and project intelligence assistant.
 You collaborate with developers to architect, specify, implement, verify, and resolve software systems.
 
+{user_profile_context}
+
 {style_directive}
 
 {domain_context}
 
 {episodic_memory_context}
+
+CRITICAL OPERATIONAL INSTRUCTIONS:
+1. Long-Term Memory & User Identity: You must strictly recall and apply all user identity facts, preferences, decisions, and project assignments documented in <user_profile> and <project_memory>. When the user asks about their identity, name, role, or project responsibilities, retrieve and confirm it directly from this context.
+2. Important User & Project Information: Whenever the user shares important details about themselves (name, role, assignments, working style) or the project (architectural choices, constraints, requirements), acknowledge them clearly; these will be consolidated into long-term memory.
+3. Technical Precision: Be helpful, accurate, and aligned with the architectural decisions and constraints specified in project memory and domain context.
+4. Project Repositories & Artifacts: Strictly ground all responses regarding connected GitHub repositories, branches, documents, and specifications using the Domain Context. When connected repositories are listed in Domain Context, confirm their connection, full name, URL, and default branch. Never claim that no repository is connected when one is documented in the context.
 """
 
 
@@ -132,10 +141,25 @@ async def assemble_context_node(state: SupervisorState) -> Dict[str, Any]:
     if not cog_state_dict:
         cog_state_dict = CognitiveState().to_dict()
 
+    # 4. Fetch authenticated user profile for persistent context awareness
+    user_profile = state.get("user_profile")
+    if not user_profile and user_id:
+        try:
+            user_rec = await prisma.user.find_unique(where={"id": user_id})
+            if user_rec:
+                user_profile = {
+                    "fullName": user_rec.fullName,
+                    "userName": user_rec.userName,
+                    "email": user_rec.email,
+                }
+        except Exception as u_err:
+            logger.debug(f"User profile lookup deferred: {u_err}")
+
     return {
         "budgeted_context": budgeted,
         "episodic_memories": memories,
-        "cognitive_state": cog_state_dict
+        "cognitive_state": cog_state_dict,
+        "user_profile": user_profile,
     }
 
 
@@ -222,7 +246,16 @@ def _build_system_instruction(state: SupervisorState) -> str:
     if memories:
         mem_parts.append(format_memories_for_prompt(memories))
 
+    user_profile_text = ""
+    profile = state.get("user_profile")
+    if profile:
+        fn = profile.get("fullName") or profile.get("name") or ""
+        un = profile.get("userName") or profile.get("username") or ""
+        em = profile.get("email") or ""
+        user_profile_text = f"<user_profile>\nUser's Full Name: {fn}\nUsername: {un}\nEmail: {em}\n</user_profile>"
+
     return SYSTEM_BASE_PROMPT.format(
+        user_profile_context=user_profile_text,
         style_directive=style_directive,
         domain_context="\n\n".join(domain_parts),
         episodic_memory_context="\n".join(mem_parts)
@@ -230,66 +263,68 @@ def _build_system_instruction(state: SupervisorState) -> str:
 
 
 async def direct_response_node(state: SupervisorState) -> Dict[str, Any]:
-    """Generates direct answer shaped by style modifier and context."""
+    """Generates direct answer shaped by style modifier and context using AI cascade."""
     user_query = state["user_query"]
     system_instruction = _build_system_instruction(state)
-    model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
+    history = state.get("budgeted_context", {}).get("tier1_chat_history", [])
+    contents = format_history_for_genai(history, user_query)
 
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model_name,
-            contents=[user_query],
+        response = await generate_content_cascade(
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.3,
             )
         )
-        content = response.text.strip() if response.text else "Direct response completed."
+        content = response.text.strip() if response and response.text else "Direct response completed."
     except Exception as e:
-        logger.warning(f"direct_response_node fallback: {e}")
+        logger.warning(f"direct_response_node cascade fallback: {e}")
         content = f"Regarding your query: '{user_query}', I am ready to assist with implementation details."
 
     return {"final_response": content}
 
 
 async def clarify_node(state: SupervisorState) -> Dict[str, Any]:
-    """Generates targeted clarifying questions when ambiguity is high."""
+    """Generates targeted clarifying questions when ambiguity is high using AI cascade."""
     user_query = state["user_query"]
     system_instruction = (
         _build_system_instruction(state)
         + "\n\nACTION: Ambiguity is high. Ask 1-3 targeted, high-impact clarifying questions before taking irreversible actions."
     )
-    model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
+    history = state.get("budgeted_context", {}).get("tier1_chat_history", [])
+    contents = format_history_for_genai(history, user_query)
 
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model_name,
-            contents=[user_query],
+        response = await generate_content_cascade(
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
             )
         )
-        content = response.text.strip() if response.text else "Could you please clarify your request?"
+        content = response.text.strip() if response and response.text else "Could you please clarify your request?"
     except Exception as e:
-        logger.warning(f"clarify_node fallback: {e}")
+        logger.warning(f"clarify_node cascade fallback: {e}")
         content = "Could you please clarify your request with specific constraints or technical details?"
 
     return {"final_response": content}
 
 
 async def search_agent_node(state: SupervisorState) -> Dict[str, Any]:
-    """Retrieves factual information using hybrid PGVector + project documents."""
+    """Retrieves factual information using hybrid PGVector + project documents with AI cascade."""
     user_query = state["user_query"]
     project_id = state["project_id"]
     system_instruction = (
         _build_system_instruction(state)
         + "\n\nACTION: Retrieve and ground facts from project specifications and documentation to address the user's technical inquiry."
     )
-    model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
 
     evidence = []
     try:
+        repos = await prisma.projectrepository.find_many(where={"projectId": project_id})
+        if repos:
+            evidence.append("Connected Repositories: " + ", ".join([f"{r.fullName} ({r.htmlUrl}, branch: {r.defaultBranch})" for r in repos]))
         docs = await prisma.document.find_many(where={"projectId": project_id}, take=5)
         if docs:
             evidence.append("Referenced Documents: " + ", ".join([d.name for d in docs]))
@@ -297,18 +332,20 @@ async def search_agent_node(state: SupervisorState) -> Dict[str, Any]:
         pass
 
     prompt_content = f"User Query: {user_query}\nEvidence:\n" + "\n".join(evidence)
+    history = state.get("budgeted_context", {}).get("tier1_chat_history", [])
+    contents = format_history_for_genai(history, prompt_content)
+
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model_name,
-            contents=[prompt_content],
+        response = await generate_content_cascade(
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
             )
         )
-        content = response.text.strip() if response.text else "Search retrieval completed."
+        content = response.text.strip() if response and response.text else "Search retrieval completed."
     except Exception as e:
-        logger.warning(f"search_agent_node fallback: {e}")
+        logger.warning(f"search_agent_node cascade fallback: {e}")
         content = f"Search retrieved project context for: '{user_query}'."
 
     return {"final_response": content, "subagent_output": content}
@@ -316,12 +353,11 @@ async def search_agent_node(state: SupervisorState) -> Dict[str, Any]:
 
 async def requirements_agent_node(state: SupervisorState) -> Dict[str, Any]:
     """
-    Extracts and structures software requirements using native Google GenAI SDK structured outputs.
+    Extracts and structures software requirements using native Google GenAI SDK structured outputs with AI cascade.
     Cross-references existing project requirements to prevent duplicate definitions.
     """
     user_query = state["user_query"]
     project_id = state["project_id"]
-    model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
 
     # Cross-reference existing requirements
     existing_titles = []
@@ -338,18 +374,19 @@ async def requirements_agent_node(state: SupervisorState) -> Dict[str, Any]:
         f"Existing Project Requirements (avoid duplicates):\n{existing_context}\n\n"
         "Extract new functional (FR) and non-functional (NFR) requirements."
     )
+    history = state.get("budgeted_context", {}).get("tier1_chat_history", [])
+    contents = format_history_for_genai(history, prompt)
 
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model_name,
-            contents=[prompt],
+        response = await generate_content_cascade(
+            contents=contents,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=RequirementsOutput,
                 temperature=0.0,
             )
         )
-        if response.text:
+        if response and response.text:
             result = RequirementsOutput.model_validate_json(response.text)
             lines = [f"### Requirement Extraction Summary: {result.summary}\n"]
             for r in result.requirements:
@@ -365,14 +402,13 @@ async def requirements_agent_node(state: SupervisorState) -> Dict[str, Any]:
 
 
 async def conflict_agent_node(state: SupervisorState) -> Dict[str, Any]:
-    """Analyzes and resolves active requirement conflicts in project state."""
+    """Analyzes and resolves active requirement conflicts in project state using AI cascade."""
     user_query = state["user_query"]
     project_id = state["project_id"]
     system_instruction = (
         _build_system_instruction(state)
         + "\n\nACTION: Analyze conflicting constraints and propose balanced compromises with technical justifications."
     )
-    model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
 
     conflicts_text = "No active conflicts reported in project state."
     try:
@@ -392,21 +428,22 @@ async def conflict_agent_node(state: SupervisorState) -> Dict[str, Any]:
         logger.warning(f"Error reading conflicts: {e}")
 
     prompt_content = f"User Request: {user_query}\n\nActive Conflicts:\n{conflicts_text}"
+    history = state.get("budgeted_context", {}).get("tier1_chat_history", [])
+    contents = format_history_for_genai(history, prompt_content)
+
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model_name,
-            contents=[prompt_content],
+        response = await generate_content_cascade(
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2,
             )
         )
-        content = response.text.strip() if response.text else "Conflict analysis completed."
+        content = response.text.strip() if response and response.text else "Conflict analysis completed."
     except Exception as e:
         logger.warning(f"conflict_agent_node fallback: {e}")
         content = f"Analyzed active conflicts regarding: '{user_query}'."
 
-    # Mark for optional human review if high severity
     return {
         "final_response": content,
         "subagent_output": content,
@@ -416,27 +453,27 @@ async def conflict_agent_node(state: SupervisorState) -> Dict[str, Any]:
 async def task_planner_node(state: SupervisorState) -> Dict[str, Any]:
     """
     Decomposes requirements and architectural decisions into executable tasks
-    using native Google GenAI SDK structured outputs (TaskPlanOutput).
+    using native Google GenAI SDK structured outputs (TaskPlanOutput) with AI cascade.
     """
     user_query = state["user_query"]
-    model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
+    history = state.get("budgeted_context", {}).get("tier1_chat_history", [])
 
     prompt = (
         f"User Query:\n{user_query}\n\n"
         "Decompose the request into discrete, actionable developer milestone tasks."
     )
+    contents = format_history_for_genai(history, prompt)
 
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model_name,
-            contents=[prompt],
+        response = await generate_content_cascade(
+            contents=contents,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=TaskPlanOutput,
                 temperature=0.0,
             )
         )
-        if response.text:
+        if response and response.text:
             result = TaskPlanOutput.model_validate_json(response.text)
             lines = [f"### Implementation Plan: {result.summary}\n"]
             for idx, t in enumerate(result.tasks, 1):
@@ -456,24 +493,24 @@ async def task_planner_node(state: SupervisorState) -> Dict[str, Any]:
 
 
 async def verify_agent_node(state: SupervisorState) -> Dict[str, Any]:
-    """Verifies consistency, edge cases, and constraint compliance."""
+    """Verifies consistency, edge cases, and constraint compliance using AI cascade."""
     user_query = state["user_query"]
     system_instruction = (
         _build_system_instruction(state)
         + "\n\nACTION: Perform technical consistency verification, auditing edge cases, security implications, and constraint integrity."
     )
-    model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
+    history = state.get("budgeted_context", {}).get("tier1_chat_history", [])
+    contents = format_history_for_genai(history, user_query)
 
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model_name,
-            contents=[user_query],
+        response = await generate_content_cascade(
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.1,
             )
         )
-        content = response.text.strip() if response.text else "Verification complete: No invariant violations detected."
+        content = response.text.strip() if response and response.text else "Verification complete: No invariant violations detected."
     except Exception as e:
         logger.warning(f"verify_agent_node fallback: {e}")
         content = f"Verified constraints and invariants for: '{user_query}'."
@@ -482,24 +519,24 @@ async def verify_agent_node(state: SupervisorState) -> Dict[str, Any]:
 
 
 async def synthesize_node(state: SupervisorState) -> Dict[str, Any]:
-    """Synthesizes multiple perspectives and architectural elements into a holistic view."""
+    """Synthesizes multiple perspectives and architectural elements into a holistic view using AI cascade."""
     user_query = state["user_query"]
     system_instruction = (
         _build_system_instruction(state)
         + "\n\nACTION: Synthesize project context, requirements, and decisions into a coherent architectural roadmap."
     )
-    model_name = settings.GEMINI_MODELS[0] if settings.GEMINI_MODELS else "gemini-3.8-flash"
+    history = state.get("budgeted_context", {}).get("tier1_chat_history", [])
+    contents = format_history_for_genai(history, user_query)
 
     try:
-        response = await genAI.aio.models.generate_content(
-            model=model_name,
-            contents=[user_query],
+        response = await generate_content_cascade(
+            contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.3,
             )
         )
-        content = response.text.strip() if response.text else "Architectural synthesis completed."
+        content = response.text.strip() if response and response.text else "Architectural synthesis completed."
     except Exception as e:
         logger.warning(f"synthesize_node fallback: {e}")
         content = f"Synthesis of architecture and technical constraints for: '{user_query}'."
@@ -597,7 +634,18 @@ async def post_turn_node(state: SupervisorState) -> Dict[str, Any]:
     except Exception as msg_err:
         logger.debug(f"Saving assistant ChatMessage deferred: {msg_err}")
 
-    # 4. Return updated messages and turn count
+    # 4. Trigger autonomous out-of-band episodic memory consolidation (Worker)
+    try:
+        from app.core.queue import enqueue_memory_consolidation
+        await enqueue_memory_consolidation(
+            user_id=state["user_id"],
+            project_id=state.get("project_id"),
+            thread_id=thread_id
+        )
+    except Exception as q_err:
+        logger.debug(f"Memory consolidation trigger deferred: {q_err}")
+
+    # 5. Return updated messages and turn count
     return {
         "cognitive_state": updated_cog_state,
         "messages": [AIMessage(content=final_resp)],
