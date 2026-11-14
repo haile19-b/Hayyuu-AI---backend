@@ -14,7 +14,7 @@ logger = logging.getLogger("mcp_test")
 # Ensure app is in path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
 
-from app.infrastructure.mcp.client_manager import MCPClientManager
+from app.infrastructure.mcp.client_manager import MCPClientManager  # noqa: E402
 
 async def main():
     logger.info("Initializing MCP Integration Test...")
