@@ -105,15 +105,8 @@ async def call_gemini_with_fallback(
     3. Exponential backoff with jitter on transient errors (503 High Demand, 429 Rate Limits, Timeouts).
     4. Real-time progress updates published to Redis via publish_progress.
     """
-    models = settings.GEMINI_MODELS if settings.GEMINI_MODELS else [
-        "gemini-3.8-flash",
-        "gemini-3.5-flash",
-        "gemini-4-argon",
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3.8-live",
-        "gemini-2.5-flash-lite",
-    ]
+    from app.core.ai_cascade import get_candidate_models
+    models = get_candidate_models()
     last_error: Optional[Exception] = None
     
     for model_index, model_name in enumerate(models):
