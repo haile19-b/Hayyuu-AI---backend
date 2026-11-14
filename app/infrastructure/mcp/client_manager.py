@@ -10,6 +10,8 @@ from mcp.client.sse import sse_client
 
 logger = logging.getLogger("uvicorn.error")
 
+_global_mcp_instance: Optional["MCPClientManager"] = None
+
 
 class MCPClientManager:
     """
@@ -20,7 +22,30 @@ class MCPClientManager:
     Discovers Tools, Resources, and Prompts dynamically and routes calls.
     """
 
+    @classmethod
+    def get_instance(cls) -> Optional["MCPClientManager"]:
+        global _global_mcp_instance
+        return _global_mcp_instance
+
+    def get_gemini_tools(self) -> Optional[List[Any]]:
+        """Converts discovered MCP tools into native Google GenAI Tool declarations."""
+        if not self.available_tools:
+            return None
+        from google.genai import types
+        declarations = []
+        for t in self.available_tools:
+            declarations.append(
+                types.FunctionDeclaration(
+                    name=t["name"],
+                    description=t.get("description", ""),
+                    parameters_json_schema=t.get("input_schema")
+                )
+            )
+        return [types.Tool(function_declarations=declarations)] if declarations else None
+
     def __init__(self, config_path: Optional[str] = None):
+        global _global_mcp_instance
+        _global_mcp_instance = self
         if config_path:
             self.config_path = config_path
         else:
