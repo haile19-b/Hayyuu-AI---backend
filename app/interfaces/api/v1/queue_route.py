@@ -48,13 +48,17 @@ async def get_queue_status() -> dict:
     try:
         queued_jobs = await queue.redis_pool.queued_jobs()
         for j in queued_jobs:
-            job = Job(j.job_id, redis=queue.redis_pool)
-            status = await job.status()
-            q_info = format_job_def(j)
-            q_info["status"] = str(status)
-            queued.append(q_info)
+            try:
+                job = Job(j.job_id, redis=queue.redis_pool)
+                status = await job.status()
+                q_info = format_job_def(j)
+                q_info["status"] = str(status)
+                queued.append(q_info)
+            except Exception as job_err:
+                # Silently skip expired job keys in Redis queue index
+                pass
     except Exception as e:
-        logger.error(f"Error fetching queued jobs: {e}")
+        logger.error(f"Error fetching queued jobs list: {e}")
         
     # 2. Fetch recently completed/failed jobs
     try:

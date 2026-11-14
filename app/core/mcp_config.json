@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "hayyuu-mcp": {
+      "transport": "stdio",
+      "command": "uv",
+      "args": ["run", "--no-sync", "python", "-m", "app.infrastructure.mcp.server"]
+    }
+  }
+}

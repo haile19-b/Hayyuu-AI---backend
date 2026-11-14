@@ -1,0 +1,1 @@
+run_id,timestamp,thread_id,turn,query,action,style_modifier,score_top3,reason,urgency,arousal,conflict_tension,failure_wariness,securing,topic_familiarity,valence,user_expertise,clarify_first,build_knowledge,extract_requirements,resolve_conflict,ground_facts,propose_tasks,verify_consistency,premature_action,hallucinated_assumptions,latency_ms

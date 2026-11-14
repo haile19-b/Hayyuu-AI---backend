@@ -5,6 +5,7 @@ datasource db {
 
 generator client {
   provider             = "prisma-client-py"
+  output               = "../.venv/Lib/site-packages/prisma"
   recursive_type_depth = 5
 }
 
@@ -78,17 +79,40 @@ enum ConflictStatus {
   RESOLVED
 }
 
+enum MessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+  TOOL
+}
+
+enum MemoryType {
+  SEMANTIC
+  EPISODIC
+  PROCEDURAL
+}
+
+enum WorkflowStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
 model User {
-  id             String    @id @default(uuid())
-  email          String    @unique
+  id             String               @id @default(uuid())
+  email          String               @unique
   hashedPassword String
   fullName       String
   userName       String
-  githubToken    String?   // Stores encrypted GitHub access token
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  githubToken    String?              // Stores encrypted GitHub access token
+  createdAt      DateTime             @default(now())
+  updatedAt      DateTime             @updatedAt
   projects       Project[]
   sessions       Session[]
+  threads        ConversationThread[]
+  memories       MemoryRecord[]
 
   @@map("users")
 }
@@ -107,24 +131,48 @@ model Session {
   @@map("sessions")
 }
 
-
-
 model Project {
-  id           String                @id @default(uuid())
-  userId       String
-  name         String
-  description  String?
-  status       ProjectStatus         @default(ACTIVE)
-  createdAt    DateTime              @default(now())
-  updatedAt    DateTime              @updatedAt
-  owner        User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
-  documents    Document[]
-  requirements Requirement[]
-  tasks        Task[]
-  suggestions  AISuggestion[]
-  conflicts    RequirementConflict[]
+  id                   String                @id @default(uuid())
+  userId               String
+  name                 String
+  description          String?
+  status               ProjectStatus         @default(ACTIVE)
+  githubInstallationId String?
+  githubRepoOwner      String?
+  githubRepoName       String?
+  githubRepoUrl        String?
+  githubConnectedAt    DateTime?
+  createdAt            DateTime              @default(now())
+  updatedAt            DateTime              @updatedAt
+  owner                User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  documents            Document[]
+  requirements         Requirement[]
+  tasks                Task[]
+  suggestions          AISuggestion[]
+  conflicts            RequirementConflict[]
+  repositories         ProjectRepository[]
+  threads              ConversationThread[]
+  workflowRuns         AgentWorkflowRun[]
+  memories             MemoryRecord[]
 
   @@map("projects")
+}
+
+model ProjectRepository {
+  id            String   @id @default(uuid())
+  projectId     String
+  owner         String
+  name          String
+  fullName      String   @unique
+  htmlUrl       String
+  defaultBranch String   @default("main")
+  isActive      Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  project       Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@map("project_repositories")
 }
 
 model Document {
@@ -211,4 +259,86 @@ model RequirementConflict {
 
   @@unique([requirementId, conflictingRequirementId])
   @@map("requirement_conflicts")
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Agent Chat Threads, Memory & Durable Workflow Run Extensions
+// ---------------------------------------------------------------------------
+
+model ConversationThread {
+  id             String             @id @default(uuid())
+  projectId      String
+  userId         String
+  title          String?            @default("New Conversation")
+  cognitiveState Json?              // MetaMo state: goals, anti-goals, modulators, turn_count, context_history
+  metadata       Json?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+  project        Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user           User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages       ChatMessage[]
+  workflowRuns   AgentWorkflowRun[]
+
+  @@index([projectId, userId])
+  @@map("conversation_threads")
+}
+
+model ChatMessage {
+  id              String             @id @default(uuid())
+  threadId        String
+  role            MessageRole
+  content         String             @db.Text
+  cognitiveAction String?            // MetaMo action: act_clarify, act_search, act_verify, etc.
+  styleModifier   String?            // style_concise, style_thorough, style_cautious, style_tutorial, style_exploratory
+  reasoning       String?            @db.Text
+  toolCalls       Json?              // Executed MCP tool calls and arguments
+  metadata        Json?
+  createdAt       DateTime           @default(now())
+  thread          ConversationThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  // Note: Deliberation telemetry (score_top3, reason, homeostatic states) is strictly NOT stored in PostgreSQL 
+  // to avoid database bloat. It is written out-of-band to structured CSV files (logs/eval/turns.csv).
+
+  // Compound B-Tree index for sub-2ms chronological window pagination
+  @@index([threadId, createdAt(sort: Asc)])
+  @@map("chat_messages")
+}
+
+model MemoryRecord {
+  id           String     @id @default(uuid())
+  userId       String
+  projectId    String?
+  type         MemoryType
+  key          String     // Hierarchical key, e.g. "architecture/database"
+  content      String     @db.Text
+  importance   Float      @default(0.5)
+  accessCount  Int        @default(0)
+  lastAccessed DateTime   @default(now())
+  metadata     Json?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project      Project?   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([userId, projectId, type])
+  @@index([key])
+  @@map("memory_records")
+}
+
+model AgentWorkflowRun {
+  id           String              @id @default(uuid())
+  projectId    String
+  threadId     String?
+  workflowType String              // "requirements_extraction", "conflict_resolution", "task_planning"
+  status       WorkflowStatus      @default(PENDING)
+  inputPayload Json?
+  result       Json?
+  errorMessage String?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+  project      Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  thread       ConversationThread? @relation(fields: [threadId], references: [id], onDelete: SetNull)
+
+  @@index([projectId, status])
+  @@map("agent_workflow_runs")
 }

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -11,10 +11,11 @@ class PropertyPair(BaseModel):
 class DynamicNode(BaseModel):
     """Dynamic graph node representation."""
     id: str = Field(description="Temporary ID or name used for linking in relationships")
-    label: str = Field(description="Entity label, e.g. 'Requirement', 'Task', 'Conflict', 'Component', 'Actor', etc.")
-    name: str = Field(description="Descriptive name or title of the entity")
-    description: str = Field(description="Main description or details of the entity")
-    properties: List[PropertyPair] = Field(default_factory=list, description="Additional custom attributes")
+    label: str = Field(description="Entity label: 'Component', 'Service', 'Actor', 'DataEntity', 'Integration', or 'Requirement'")
+    name: str = Field(description="Descriptive name of the entity (max 8 words)")
+    description: str = Field(description="Concise 1-sentence description of the entity")
+    source_chunk_index: Optional[int] = Field(None, description="0-based index of the text chunk from which this entity was extracted")
+    properties: List[PropertyPair] = Field(default_factory=list, description="At most 2-3 essential technical key-value properties")
 
 
 class DynamicRelationship(BaseModel):

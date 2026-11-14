@@ -12,6 +12,7 @@ class ChunkData(BaseModel):
     start_char: int
     end_char: int
     embedding: Optional[List[float]] = None
+    metadata: Optional[dict] = None
 
 
 class KnowledgeBuilderState(BaseModel):

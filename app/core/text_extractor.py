@@ -5,10 +5,72 @@ from pypdf import PdfReader
 from google import genai
 from google.genai import types
 import anyio
+
 from app.core.env import settings
 from app.core.config import genAI
 
 logger = logging.getLogger("uvicorn.error")
+
+import os
+from typing import Tuple, Optional, Any
+
+# Lazy singleton instance for IBM Docling DocumentConverter
+_doc_converter_instance: Optional[Any] = None
+_doc_converter_initialized: bool = False
+
+def get_doc_converter() -> Optional[Any]:
+    """Retrieve or initialize the IBM Docling DocumentConverter singleton."""
+    global _doc_converter_instance, _doc_converter_initialized
+    if _doc_converter_initialized:
+        return _doc_converter_instance
+
+    try:
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            PdfPipelineOptions,
+            TableFormerMode,
+            AcceleratorOptions,
+        )
+        from docling.datamodel.accelerator_options import AcceleratorDevice
+
+        pipeline_options = PdfPipelineOptions()
+        # 1. Performance: disable CPU OCR on digital PDFs (fallback routes scanned docs to Gemini Vision)
+        pipeline_options.do_ocr = False
+        # 2. Performance: fast table structure mode
+        pipeline_options.do_table_structure = True
+        pipeline_options.table_structure_options.mode = TableFormerMode.FAST
+        # 3. Performance: skip raster page and picture rendering
+        pipeline_options.generate_page_images = False
+        pipeline_options.generate_picture_images = False
+        pipeline_options.generate_table_images = False
+        pipeline_options.images_scale = 1.0
+        # 4. Multi-threading optimization
+        cpu_cores = os.cpu_count() or 4
+        pipeline_options.accelerator_options = AcceleratorOptions(
+            num_threads=min(4, cpu_cores),
+            device=AcceleratorDevice.AUTO,
+        )
+
+        _doc_converter_instance = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
+        logger.info("✅ High-Speed IBM Docling DocumentConverter Initialized Successfully")
+    except Exception as doc_err:
+        logger.error(f"Failed to initialize Docling converter: {doc_err}")
+        _doc_converter_instance = None
+
+    _doc_converter_initialized = True
+    return _doc_converter_instance
+
+
+def __getattr__(name: str) -> Any:
+    if name == "doc_converter":
+        return get_doc_converter()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
     """Synchronous helper to extract text from a DOCX file."""
@@ -28,6 +90,7 @@ def extract_text_from_docx(file_bytes: bytes) -> str:
         logger.error(f"Error reading DOCX file: {e}")
         raise e
 
+
 def extract_text_from_pdf_digital(file_bytes: bytes) -> str:
     """Synchronous helper to extract text from a digital PDF."""
     try:
@@ -42,10 +105,10 @@ def extract_text_from_pdf_digital(file_bytes: bytes) -> str:
         logger.error(f"Error reading PDF digitally: {e}")
         raise e
 
+
 async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
     """Call Gemini to extract text from scanned PDFs or images using the google-genai SDK."""
     try:
-        
         prompt = (
             "You are a document transcription system. Extract and transcribe all the textual content "
             "from this document. Present it clearly, preserving structural flow where possible. "
@@ -60,7 +123,7 @@ async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
         
         def _generate():
             response = genAI.models.generate_content(
-                model="gemini-3.5-flash",
+                model="gemini-3.8-flash",
                 contents=[binary_part, prompt]
             )
             return response.text
@@ -70,21 +133,78 @@ async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
         logger.error(f"Error performing OCR text extraction via Gemini: {e}")
         raise e
 
+
+def extract_docling_document(file_bytes: bytes, content_type: str) -> Tuple[Optional[str], Optional[Any]]:
+    """
+    Synchronously converts document bytes into a DoclingDocument instance using the optimized converter.
+    Returns (markdown_text, docling_doc) if successful, otherwise (None, None).
+    """
+    converter = get_doc_converter()
+    if not converter:
+        return None, None
+
+    c_type = content_type.lower()
+    is_pdf = "pdf" in c_type or c_type == "application/pdf"
+    is_docx = (
+        "wordprocessingml.document" in c_type
+        or c_type == "docx"
+        or "vnd.openxmlformats-officedocument.wordprocessingml" in c_type
+    )
+
+    if not (is_pdf or is_docx):
+        return None, None
+
+    try:
+        from docling.datamodel.base_models import DocumentStream
+        ext = "pdf" if is_pdf else "docx"
+        source = DocumentStream(name=f"document.{ext}", stream=BytesIO(file_bytes))
+        result = converter.convert(source)
+        markdown_text = result.document.export_to_markdown()
+        return markdown_text, result.document
+    except Exception as e:
+        logger.warning(f"Docling conversion failed: {e}")
+        return None, None
+
+
 async def extract_text(file_bytes: bytes, content_type: str) -> str:
     """
     Core entry point to extract text based on mime-type.
-    Uses native libraries for digital files and falls back to Gemini for OCR/scanned files.
+    Uses IBM Docling for layout-aware Markdown extraction (tables, headers) when available.
+    Falls back to legacy extractors on failure or unsupported formats.
     """
     c_type = content_type.lower()
-    
-    # DOCX
-    if "wordprocessingml.document" in c_type or c_type == "docx" or c_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-        logger.info("Extracting text from DOCX document")
+    is_pdf = "pdf" in c_type or c_type == "application/pdf"
+    is_docx = (
+        "wordprocessingml.document" in c_type
+        or c_type == "docx"
+        or "vnd.openxmlformats-officedocument.wordprocessingml" in c_type
+    )
+
+    # 1. Attempt structured extraction via IBM Docling
+    converter = get_doc_converter()
+    if converter and (is_pdf or is_docx):
+        logger.info(f"Attempting high-speed layout-aware text extraction for {content_type} via Docling")
+        try:
+            def _convert():
+                md, _ = extract_docling_document(file_bytes, content_type)
+                return md
+            
+            markdown_text = await anyio.to_thread.run_sync(_convert)
+            if markdown_text and markdown_text.strip():
+                logger.info("Successfully extracted text via Docling.")
+                return markdown_text
+        except Exception as e:
+            logger.warning(f"Docling extraction failed: {e}. Falling back to legacy extractors.")
+
+    # 2. Legacy/Fallback extraction paths
+    # DOCX Fallback
+    if is_docx:
+        logger.info("Extracting text from DOCX document using fallback helper")
         return await anyio.to_thread.run_sync(extract_text_from_docx, file_bytes)
         
-    # PDF
-    elif "pdf" in c_type or c_type == "application/pdf":
-        logger.info("Extracting text from PDF document")
+    # PDF Fallback
+    elif is_pdf:
+        logger.info("Extracting text from PDF document using fallback helper")
         # Try digital extraction first
         digital_text = await anyio.to_thread.run_sync(extract_text_from_pdf_digital, file_bytes)
         
@@ -99,7 +219,6 @@ async def extract_text(file_bytes: bytes, content_type: str) -> str:
     # Images
     elif "image" in c_type or c_type in ["png", "jpg", "jpeg", "webp"]:
         logger.info(f"Extracting text from image ({content_type}) via Gemini Vision")
-        # Treat image types properly or fallback to general image/png
         mime_type = content_type if "image" in c_type else f"image/{c_type.replace('jpg', 'jpeg')}"
         return await extract_text_via_gemini(file_bytes, mime_type)
         

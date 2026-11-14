@@ -3,12 +3,15 @@ import uuid
 import re
 from typing import Dict, Any, List
 from google.genai import types
+import anyio
 
 from app.core.config import genAI
-from app.core.database import prisma
+from app.core.database import prisma, ensure_db_connected
 from app.core.storage import storage_utility
-from app.core.text_extractor import extract_text
+from app.core.progress import publish_progress
+from app.core.text_extractor import extract_text, extract_docling_document
 from app.libs.chunker import chunk_document_text
+from app.agents.requirements_extractor.tools import clean_json_response, call_gemini_with_fallback
 from app.infrastructure.ai.gemini_embedder import gemini_embedder
 from app.infrastructure.vector_store.pgvector import pgvector_store
 from app.infrastructure.graph_store.neo4j import neo4j_graph_store
@@ -43,26 +46,56 @@ async def preprocess_chunk_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     """Downloads files if needed, extracts text, and partitions text into token chunks."""
     raw_text = state.raw_text
     doc_id = state.document_id
+    docling_doc = None
+
+    if doc_id:
+        await publish_progress(doc_id, "Preparing document text and structural layout...", "preprocess")
 
     if not raw_text.strip():
         if not doc_id:
-            return {"errors": state.errors + ["Both raw_text and document_id are missing. Cannot ingest."]}
+            raise ValueError("Both raw_text and document_id are missing. Cannot ingest.")
         
         logger.info(f"[Node: preprocess_chunk] Downloading document '{doc_id}' to extract plain text...")
         try:
+            await ensure_db_connected()
             document = await prisma.document.find_unique(where={"id": doc_id})
             if not document:
-                return {"errors": state.errors + [f"Document with ID {doc_id} not found."]}
+                raise ValueError(f"Document with ID {doc_id} not found.")
 
+            if doc_id:
+                await publish_progress(doc_id, f"Downloading file '{document.name}' from storage...", "preprocess")
             file_bytes = await storage_utility.download_file(document.filePath)
-            raw_text = await extract_text(file_bytes, document.fileType)
+
+            if doc_id:
+                await publish_progress(doc_id, "Extracting layout, sections, and tables via Docling...", "preprocess")
+
+            # 1. Attempt single-pass extraction & DoclingDocument generation
+            try:
+                def _extract_doc():
+                    return extract_docling_document(file_bytes, document.fileType)
+
+                raw_text, docling_doc = await anyio.to_thread.run_sync(_extract_doc)
+            except Exception as doc_err:
+                logger.warning(f"Docling extraction failed during preprocessing: {doc_err}")
+                raw_text, docling_doc = None, None
+
+            # 2. Fall back to standard extract_text if Docling didn't extract text
+            if not raw_text or not raw_text.strip():
+                logger.info("Falling back to extract_text extractor")
+                if doc_id:
+                    await publish_progress(doc_id, "Docling unavailable. Extracting text using fallback extractor...", "preprocess")
+                raw_text = await extract_text(file_bytes, document.fileType)
         except Exception as e:
             logger.error(f"Error extracting text during preprocessing: {e}")
-            return {"errors": state.errors + [f"Text extraction error: {e}"]}
+            if doc_id:
+                await publish_progress(doc_id, f"Text extraction failed: {str(e)}", "preprocess", status="FAILED")
+            raise RuntimeError(f"Text extraction error: {e}")
 
-    # Partition text into chunks
+    # Partition text into chunks (reusing in-memory DoclingDocument if available)
     try:
-        chunks = chunk_document_text(raw_text)
+        if doc_id:
+            await publish_progress(doc_id, "Chunking document text while preserving section hierarchy and tables...", "preprocess")
+        chunks = chunk_document_text(raw_text, docling_doc=docling_doc)
         chunk_objects = [
             ChunkData(
                 chunk_index=c["chunk_index"],
@@ -70,38 +103,57 @@ async def preprocess_chunk_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                 token_count=c["token_count"],
                 start_char=c["start_char"],
                 end_char=c["end_char"],
+                metadata=c.get("metadata"),
             )
             for c in chunks
         ]
         logger.info(f"[Node: preprocess_chunk] Partitioned text into {len(chunk_objects)} chunks.")
-        return {"raw_text": raw_text, "chunks": chunk_objects}
+        if doc_id:
+            await publish_progress(doc_id, f"Document preprocessing complete. Created {len(chunk_objects)} semantic chunks.", "preprocess")
+        return {
+            "raw_text": raw_text,
+            "chunks": chunk_objects
+        }
     except Exception as e:
         logger.error(f"Error chunking text: {e}")
-        return {"errors": state.errors + [f"Chunking error: {e}"]}
+        if doc_id:
+            await publish_progress(doc_id, f"Document chunking failed: {str(e)}", "preprocess", status="FAILED")
+        raise RuntimeError(f"Chunking error: {e}")
 
 
 # 2. Generate Embeddings Node
 async def generate_embeddings_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     """Generates 768-dimensional embeddings for all chunks using gemini-embedding-2."""
-    if state.errors:
-        return {}
-
     chunks = state.chunks
+    doc_id = state.document_id
     if not chunks:
         return {}
 
+    # Check if embeddings are already present in state
+    if all(c.embedding is not None and len(c.embedding) > 0 for c in chunks):
+        logger.info(f"[Node: generate_embeddings] Embeddings already present for all {len(chunks)} chunks. Skipping computation.")
+        if doc_id:
+            await publish_progress(doc_id, f"Reusing {len(chunks)} existing pre-computed vector embeddings.", "embed")
+        return {"chunks": chunks}
+
     try:
         logger.info(f"[Node: generate_embeddings] Generating embeddings for {len(chunks)} chunks...")
+        if doc_id:
+            await publish_progress(doc_id, f"Generating 768-dimensional vector embeddings for {len(chunks)} chunks using Gemini...", "embed")
         contents = [c.content for c in chunks]
         embeddings = gemini_embedder.embed_batch(contents)
 
         for idx, chunk in enumerate(chunks):
             chunk.embedding = embeddings[idx]
 
+        if doc_id:
+            await publish_progress(doc_id, f"Generated vector embeddings for {len(chunks)} chunks successfully.", "embed")
         return {"chunks": chunks}
     except Exception as e:
         logger.error(f"Failed to generate embeddings: {e}")
-        return {"errors": state.errors + [f"Embedding generation failed: {e}"]}
+        if doc_id:
+            await publish_progress(doc_id, f"Embedding generation failed: {str(e)}", "embed", status="FAILED")
+        raise RuntimeError(f"Embedding generation failed: {e}")
 
 
 # 3. Extract Graph Node
@@ -110,60 +162,71 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     Invokes Gemini using structured schemas to extract dynamic entity nodes and relationships.
     Uses stable namespace UUID5 mapping to ensure duplicate-free elements.
     """
-    if state.errors:
-        return {}
-
     project_id = state.project_id
     doc_id = state.document_id
 
+    # 0. Check if graph was already extracted in state
+    if state.extracted_graph and state.extracted_graph.nodes:
+        logger.info(f"[Node: extract_graph] Graph already extracted in state ({len(state.extracted_graph.nodes)} nodes). Skipping LLM re-extraction.")
+        if doc_id:
+            await publish_progress(doc_id, f"Reusing {len(state.extracted_graph.nodes)} extracted entities from state.", "extract")
+        return {"extracted_graph": state.extracted_graph}
+
+    # Segment raw text with chunk index boundaries for source chunk tracking
+    chunks_text_list = []
+    for c in state.chunks:
+        chunks_text_list.append(f"--- Chunk Index: {c.chunk_index} ---\n{c.content}")
+    raw_text_with_boundaries = "\n\n".join(chunks_text_list)
+    if not raw_text_with_boundaries.strip():
+        raw_text_with_boundaries = state.raw_text
+
     prompt = f"""
-    You are an expert systems engineering analyst. Your task is to extract all key entities and relationships from the provided context.
+    You are an expert systems engineering analyst. Your task is to extract core architectural entities and relationships from the provided context.
 
     Guidelines:
-    1. Identify all core entities in the document context. Label them appropriately (e.g., 'Requirement', 'Task', 'Conflict', 'Component', 'Actor', etc.).
-    2. Extract their name, description, and list any other custom attributes (properties) as key-value pairs.
-    3. Identify how they relate to each other. Label relationship types descriptively (e.g. 'OWNS', 'TRACKS', 'CONTAINS', 'IMPLEMENTS', 'CONFLICTS_WITH', 'DEPENDS_ON').
-    4. Connect the entities using their temporary IDs (the 'id' field you assign, such as 'req_1', 'task_login').
-    5. Do not include User, Project, or Document nodes directly in the output list; the pipeline will automatically map and attach them.
+    1. Focus on core architectural entities: 'Component', 'Service', 'Actor', 'DataEntity', 'Integration', or 'Requirement'. Avoid extracting granular subtasks or step-by-step developer tasks.
+    2. For each entity you extract, identify which chunk index (0-based integer) it belongs to based on the '--- Chunk Index: X ---' markers in the text, and set the `source_chunk_index` property to that index.
+    3. Keep entity descriptions concise (1 sentence). Limit custom properties to at most 2-3 essential technical attributes.
+    4. Identify how they relate to each other. Label relationship types descriptively (e.g. 'DEPENDS_ON', 'INTEGRATES_WITH', 'CONTAINS', 'CALLS', 'IMPLEMENTS').
+    5. Connect the entities using their temporary IDs (the 'id' field you assign, such as 'comp_auth', 'service_db').
+    6. Do not include User, Project, or Document nodes directly in the output list; the pipeline will automatically map and attach them.
 
-    Context to analyze:
+    Context to analyze (segmented by chunk boundaries):
     ---
-    {state.raw_text}
+    {raw_text_with_boundaries}
     ---
     """
+
+    if doc_id:
+        await publish_progress(doc_id, "Extracting knowledge graph entities and relationships via Gemini AI...", "extract")
 
     try:
         # Check if we should use multimodal file URI or fall back to raw text
         if state.gemini_file_uri and state.gemini_file_mime_type:
             logger.info(f"[Node: extract_graph] Running extraction using Gemini File URI: {state.gemini_file_uri}")
-            response = genAI.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Part.from_uri(file_uri=state.gemini_file_uri, mime_type=state.gemini_file_mime_type),
-                    prompt
-                ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ExtractedKnowledgeGraph,
-                    temperature=0.1,
-                ),
-            )
+            input_contents = [
+                {"type": "document", "uri": state.gemini_file_uri, "mime_type": state.gemini_file_mime_type},
+                {"type": "text", "text": prompt}
+            ]
         else:
             logger.info("[Node: extract_graph] Running extraction using raw text input...")
-            response = genAI.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=ExtractedKnowledgeGraph,
-                    temperature=0.1,
-                ),
-            )
+            input_contents = [
+                {"type": "text", "text": prompt}
+            ]
 
-        raw_graph = ExtractedKnowledgeGraph.model_validate_json(response.text)
+        clean_text = await call_gemini_with_fallback(
+            input_contents=input_contents,
+            response_schema=ExtractedKnowledgeGraph,
+            doc_id=doc_id,
+            step_name="extract_graph",
+            temperature=0.1
+        )
+        raw_graph = ExtractedKnowledgeGraph.model_validate_json(clean_text)
     except Exception as e:
         logger.error(f"Error during graph extraction: {e}")
-        return {"errors": state.errors + [f"Graph extraction error: {e}"]}
+        if doc_id:
+            await publish_progress(doc_id, f"Graph extraction failed: {str(e)}", "extract", status="FAILED")
+        raise RuntimeError(f"Graph extraction error: {e}")
 
     # Perform stable ID mapping
     id_mapping: Dict[str, str] = {}
@@ -192,6 +255,7 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                 label=node.label,
                 name=node.name,
                 description=node.description,
+                source_chunk_index=node.source_chunk_index,
                 properties=node.properties,
             )
         )
@@ -249,57 +313,148 @@ async def extract_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
 
     processed_graph = ExtractedKnowledgeGraph(nodes=nodes, relationships=relationships)
     logger.info(f"[Node: extract_graph] Processed {len(nodes)} nodes and {len(relationships)} relationships.")
+    if doc_id:
+        await publish_progress(
+            doc_id,
+            f"Knowledge graph extraction complete. Identified {len(nodes)} entity nodes and {len(relationships)} relationships.",
+            "extract",
+        )
     return {"extracted_graph": processed_graph}
 
 
 # 4. Store Vectors Node
 async def store_vectors_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
-    """Persists document chunks and vector embeddings into PGVector."""
-    if state.errors:
-        return {}
-
+    """Persists document chunks and vector embeddings directly into Neo4j."""
     doc_id = state.document_id or "synthesized-doc"
     proj_id = state.project_id
 
-    logger.info(f"[Node: store_vectors] Writing vector chunks for document {doc_id} to PGVector...")
+    logger.info(f"[Node: store_vectors] Storing vector chunks for document {doc_id} directly in Neo4j...")
+    if state.document_id:
+        await publish_progress(state.document_id, f"Indexing {len(state.chunks)} vector chunks and chunk relationships in Neo4j...", "store_vectors")
     
-    chunk_dicts = []
+    import json
+    chunk_batch = []
     for c in state.chunks:
-        chunk_dicts.append(
+        # Generate stable UUID for Chunk node
+        chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{proj_id}-{doc_id}-chunk-{c.chunk_index}"))
+        
+        meta = {
+            "token_count": c.token_count,
+            "start_char": c.start_char,
+            "end_char": c.end_char,
+            "filename": state.filename,
+        }
+        if c.metadata:
+            meta.update(c.metadata)
+            
+        chunk_batch.append(
             {
+                "id": chunk_uuid,
+                "document_id": doc_id,
+                "project_id": proj_id,
                 "chunk_index": c.chunk_index,
                 "content": c.content,
                 "embedding": c.embedding,
-                "metadata": {
-                    "token_count": c.token_count,
-                    "start_char": c.start_char,
-                    "end_char": c.end_char,
-                    "filename": state.filename,
-                },
+                "metadata": json.dumps(meta),
             }
         )
 
     try:
-        stored_count = await pgvector_store.upsert_chunks(
-            document_id=doc_id,
-            project_id=proj_id,
-            chunks=chunk_dicts,
-        )
-        return {"total_vectors_stored": stored_count}
+        # Idempotency: delete old chunks for this document in Neo4j
+        delete_query = """
+        MATCH (c:Chunk {document_id: $doc_id})
+        DETACH DELETE c
+        """
+        await neo4j_graph_store.execute_query(delete_query, {"doc_id": doc_id})
+
+        # Batch insert chunk nodes
+        insert_query = """
+        UNWIND $batch as row
+        MERGE (c:Chunk {id: row.id})
+        SET c.document_id = row.document_id,
+            c.project_id = row.project_id,
+            c.chunk_index = row.chunk_index,
+            c.content = row.content,
+            c.embedding = row.embedding,
+            c.metadata = row.metadata,
+            c.created_at = timestamp()
+        """
+        await neo4j_graph_store.execute_write_batch(insert_query, chunk_batch)
+
+        # Connect chunks to Project
+        project_link = """
+        MATCH (p:Project {id: $proj_id})
+        MATCH (c:Chunk {project_id: $proj_id, document_id: $doc_id})
+        MERGE (p)-[:HAS_CHUNK]->(c)
+        """
+        await neo4j_graph_store.execute_query(project_link, {"proj_id": proj_id, "doc_id": doc_id})
+
+        # Connect chunks to Document
+        doc_link = """
+        MATCH (d:Document {id: $doc_id})
+        MATCH (c:Chunk {document_id: $doc_id})
+        MERGE (c)-[:PART_OF]->(d)
+        """
+        await neo4j_graph_store.execute_query(doc_link, {"doc_id": doc_id})
+
+        # Link chunks sequentially without APOC dependency
+        sequence_link = """
+        MATCH (c1:Chunk {document_id: $doc_id})
+        MATCH (c2:Chunk {document_id: $doc_id})
+        WHERE c2.chunk_index = c1.chunk_index + 1
+        MERGE (c1)-[:NEXT]->(c2)
+        """
+        await neo4j_graph_store.execute_query(sequence_link, {"doc_id": doc_id})
+
+        # Link document to the first chunk of each distinct section path
+        last_section_path = None
+        for c in state.chunks:
+            meta = c.metadata or {}
+            section_path = meta.get("section_path")
+            if section_path and section_path != last_section_path:
+                last_section_path = section_path
+                chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{proj_id}-{doc_id}-chunk-{c.chunk_index}"))
+                section_query = """
+                MATCH (d:Document {id: $doc_id})
+                MATCH (c:Chunk {id: $chunk_uuid})
+                MERGE (d)-[:SECTION {name: $section_name}]->(c)
+                """
+                await neo4j_graph_store.execute_query(
+                    section_query,
+                    {
+                        "doc_id": doc_id,
+                        "chunk_uuid": chunk_uuid,
+                        "section_name": section_path
+                    }
+                )
+
+        if state.document_id:
+            await publish_progress(
+                state.document_id,
+                f"Successfully indexed {len(chunk_batch)} vector chunks and structural links in Neo4j.",
+                "store_vectors",
+            )
+        return {"total_vectors_stored": len(chunk_batch)}
     except Exception as e:
-        logger.error(f"Failed storing vectors: {e}")
-        return {"errors": state.errors + [f"PGVector write error: {e}"]}
+        logger.error(f"Failed storing chunk vectors in Neo4j: {e}")
+        if state.document_id:
+            await publish_progress(state.document_id, f"Neo4j vector write failed: {str(e)}", "store_vectors", status="FAILED")
+        raise RuntimeError(f"Neo4j vector write error: {e}")
 
 
 # 5. Store Graph Node
 async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     """Writes nodes and relationships dynamically into Neo4j."""
-    if state.errors:
-        return {}
-
     graph = state.extracted_graph
     project_id = state.project_id
     doc_id = state.document_id
+
+    if doc_id:
+        await publish_progress(
+            doc_id,
+            f"Writing {len(graph.nodes)} entity nodes and {len(graph.relationships)} relationships to Neo4j graph store...",
+            "store_graph",
+        )
 
     # 1. Synthesize project node in Neo4j
     project_merge = """
@@ -323,6 +478,8 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
             )
     except Exception as e:
         logger.error(f"Failed to merge context nodes in Neo4j: {e}")
+        if doc_id:
+            await publish_progress(doc_id, f"Neo4j context merge failed: {str(e)}", "store_graph", status="FAILED")
         return {"errors": state.errors + [f"Neo4j context merge error: {e}"]}
 
     # 2. Write dynamic nodes
@@ -332,14 +489,20 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
         # Safe formatting because label is vetted as alphanumeric/extracted by LLM
         label = re.sub(r"[^\w]", "", node.label) or "Node"
         node_query = f"""
-        MERGE (n:{label} {{id: $id}})
-        ON CREATE SET n.name = $name, n.description = $description, n.created_at = timestamp()
-        ON MATCH SET n.name = $name, n.description = $description
+        MERGE (n:Entity:{label} {{id: $id}})
+        ON CREATE SET n.name = $name, n.description = $description, n.project_id = $project_id, n.document_id = $document_id, n.created_at = timestamp()
+        ON MATCH SET n.name = $name, n.description = $description, n.project_id = $project_id, n.document_id = $document_id
         """
         try:
             await neo4j_graph_store.execute_query(
                 node_query,
-                {"id": node.id, "name": node.name, "description": node.description},
+                {
+                    "id": node.id,
+                    "name": node.name,
+                    "description": node.description,
+                    "project_id": project_id,
+                    "document_id": doc_id,
+                },
             )
             
             # Write dynamic properties
@@ -356,9 +519,48 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
                         "props": props_dict,
                     },
                 )
+
+            # Link dynamic node to its specific source chunk in Neo4j if available
+            if node.source_chunk_index is not None and doc_id:
+                chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{project_id}-{doc_id}-chunk-{node.source_chunk_index}"))
+                link_query = f"""
+                MATCH (c:Chunk {{id: $chunk_uuid}})
+                MATCH (n:{label} {{id: $node_id}})
+                MERGE (c)-[:HAS_ENTITY]->(n)
+                """
+                await neo4j_graph_store.execute_query(
+                    link_query,
+                    {
+                        "chunk_uuid": chunk_uuid,
+                        "node_id": node.id
+                    }
+                )
+
+            # Fallback substring matching: link any chunks containing the entity's name
+            if doc_id:
+                for c in state.chunks:
+                    if node.source_chunk_index == c.chunk_index:
+                        continue
+                    if len(node.name) > 3 and node.name.lower() in c.content.lower():
+                        chunk_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{project_id}-{doc_id}-chunk-{c.chunk_index}"))
+                        fallback_link_query = f"""
+                        MATCH (c:Chunk {{id: $chunk_uuid}})
+                        MATCH (n:{label} {{id: $node_id}})
+                        MERGE (c)-[:MENTIONS]->(n)
+                        """
+                        await neo4j_graph_store.execute_query(
+                            fallback_link_query,
+                            {
+                                "chunk_uuid": chunk_uuid,
+                                "node_id": node.id
+                            }
+                        )
+
             node_count += 1
         except Exception as e:
             logger.error(f"Failed writing node '{node.name}' of label '{label}': {e}")
+            if doc_id:
+                await publish_progress(doc_id, f"Failed writing graph node '{node.name}': {str(e)}", "store_graph", status="FAILED")
             return {"errors": state.errors + [f"Neo4j node write error: {e}"]}
 
     # 3. Write dynamic relationships
@@ -400,15 +602,55 @@ async def store_graph_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
             logger.warning(f"Could not connect source {rel.source_id} to target {rel.target_id} in Neo4j.")
 
     logger.info(f"[Node: store_graph] Wrote {node_count} nodes and {rel_count} relations to Neo4j.")
+    if doc_id:
+        await publish_progress(
+            doc_id,
+            f"Neo4j graph memory populated with {node_count} nodes and {rel_count} relationships.",
+            "store_graph",
+        )
     return {"total_nodes_stored": node_count + rel_count}
 
 
 # 6. Save Results Node
 async def save_results_node(state: KnowledgeBuilderState) -> Dict[str, Any]:
     """Compiles statistics and saves results status."""
+    doc_id = state.document_id
     if state.errors:
         logger.error(f"Knowledge builder pipeline finished with errors: {state.errors}")
+        if doc_id:
+            await publish_progress(
+                doc_id,
+                f"Knowledge builder pipeline encountered errors: {'; '.join(state.errors)}",
+                "save_results",
+                status="FAILED"
+            )
         return {"status": "failed"}
 
     logger.info(f"Knowledge builder pipeline completed. Vectors stored: {state.total_vectors_stored}, Graph elements stored: {state.total_nodes_stored}")
+    if doc_id:
+        await publish_progress(
+            doc_id,
+            f"Knowledge base indexing complete: {state.total_vectors_stored or 0} vector chunks and {state.total_nodes_stored or 0} graph elements indexed.",
+            "save_results",
+        )
+        # Persist completion marker in DB to guarantee idempotency across retries
+        try:
+            from prisma import Json
+            from prisma.enums import SuggestionStatus
+            await ensure_db_connected()
+            await prisma.aisuggestion.create(
+                data={
+                    "projectId": state.project_id,
+                    "type": "doc_kb_indexed",
+                    "content": Json({
+                        "documentId": doc_id,
+                        "vectors_stored": state.total_vectors_stored or 0,
+                        "nodes_stored": state.total_nodes_stored or 0,
+                    }),
+                    "status": SuggestionStatus.ACCEPTED
+                }
+            )
+        except Exception as m_err:
+            logger.debug(f"Non-fatal KB marker write: {m_err}")
+
     return {"status": "completed"}

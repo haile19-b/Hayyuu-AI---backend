@@ -53,13 +53,13 @@ async def test_langgraph_agent_execution():
 
     # Patch database calls & gemini API calls to avoid network dependency in unit tests
     with patch("app.infrastructure.graph_store.neo4j.neo4j_graph_store.execute_query", new_callable=AsyncMock) as mock_neo4j, \
-         patch("app.agents.knowledge_builder.nodes.pgvector_store.upsert_chunks", new_callable=AsyncMock) as mock_vector, \
+         patch("app.infrastructure.graph_store.neo4j.neo4j_graph_store.execute_write_batch", new_callable=AsyncMock) as mock_neo4j_batch, \
          patch("app.agents.knowledge_builder.nodes.gemini_embedder.embed_batch") as mock_embed, \
          patch("app.agents.knowledge_builder.nodes.genAI.models.generate_content") as mock_generate:
         
         mock_generate.return_value = MockGenerateResponse()
         mock_embed.return_value = [[0.01] * 768, [0.02] * 768]
-        mock_vector.return_value = 2
+        mock_neo4j_batch.return_value = []
 
         # Run graph
         final_state = await knowledge_builder_graph.ainvoke(state)
@@ -71,7 +71,7 @@ async def test_langgraph_agent_execution():
         assert len(graph.relationships) >= 1
 
         # Verify execution stats
-        assert final_state["total_vectors_stored"] == 2
+        assert final_state["total_vectors_stored"] == 1
         assert final_state["total_nodes_stored"] > 0
         assert final_state["status"] == "completed"
         assert len(final_state["errors"]) == 0
