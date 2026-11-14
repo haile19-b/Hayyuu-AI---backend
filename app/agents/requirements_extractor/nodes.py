@@ -6,7 +6,7 @@ from google import genai
 
 from app.agents.requirements_extractor.schema import ExtractionResponse, SuggestionsResponse
 from app.agents.requirements_extractor.tools import call_gemini_with_fallback, clean_json_response
-from app.core.database import prisma
+from app.core.database import prisma, ensure_db_connected
 from prisma import Json
 from app.core.storage import storage_utility
 from app.core.progress import publish_progress
@@ -28,6 +28,7 @@ async def ingest_document_node(state: DocumentAnalysisState) -> dict:
     await publish_progress(doc_id, "Preparing document ingestion...", "ingest_document")
     
     # 1. Fetch document metadata
+    await ensure_db_connected()
     document = await prisma.document.find_unique(where={"id": doc_id})
     if not document:
         raise ValueError(f"Document with ID {doc_id} not found in database")
@@ -72,6 +73,7 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
             "extracted_requirement_ids": state["extracted_requirement_ids"]
         }
 
+    await ensure_db_connected()
     existing_marker = await prisma.aisuggestion.find_first(
         where={
             "projectId": proj_id,
@@ -136,6 +138,7 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
         raise ValueError(f"Gemini joint extraction returned invalid JSON: {e}")
         
     # Save Requirements & Tasks
+    await ensure_db_connected()
     await publish_progress(doc_id, f"Saving {len(reqs)} draft requirements and tasks to the database...", "extract_requirements")
     
     temp_id_to_uuid = {}
@@ -299,6 +302,7 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
             "suggestions_count": state.get("suggestions_count", 0)
         }
 
+    await ensure_db_connected()
     existing_suggestions = await prisma.aisuggestion.find_many(
         where={"projectId": proj_id, "type": "gap_analysis"}
     )
@@ -357,6 +361,8 @@ async def generate_suggestions_node(state: DocumentAnalysisState) -> dict:
             "suggestions_count": 0
         }
         
+    # Reconnect DB before batch insertion after long-running LLM call
+    await ensure_db_connected()
     await publish_progress(doc_id, f"Saving {len(suggestions)} AI suggestions to the database...", "generate_suggestions")
     
     suggestion_coroutines = [
