@@ -18,8 +18,11 @@ from app.core.env import settings
 # Configure logging
 logger = logging.getLogger("uvicorn.error")
 
-# Global prisma client instance configured with serverless pool parameters
-prisma = Prisma(datasource={"url": settings.prisma_database_url})
+# Global prisma client instance configured with serverless pool parameters and extended timeout
+prisma = Prisma(
+    datasource={"url": settings.prisma_database_url},
+    http={"timeout": 60.0}
+)
 
 # Global AsyncConnectionPool and LangGraph components
 _pg_pool: Optional[AsyncConnectionPool] = None
@@ -35,7 +38,7 @@ async def get_pg_pool() -> AsyncConnectionPool:
         _pg_pool = AsyncConnectionPool(
             conninfo=dsn,
             min_size=1,
-            max_size=10,
+            max_size=3,
             kwargs={
                 "autocommit": True,
                 "keepalives": 1,
