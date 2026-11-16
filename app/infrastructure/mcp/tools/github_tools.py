@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Any
 from mcp.server import MCPServer
 import httpx
 
-from app.core.database import prisma
+from app.core.database import prisma, ensure_db_connected
 from app.infrastructure.github.github_service import github_service
 
 logger = logging.getLogger("uvicorn.error")
@@ -19,6 +19,7 @@ async def get_github_auth_headers(project_id: str) -> Dict[str, str]:
     Prioritizes GitHub App Installation Access Tokens via github_service,
     with fallback to project.owner.githubToken for legacy/personal OAuth tokens.
     """
+    await ensure_db_connected()
     token: Optional[str] = None
     try:
         token = await github_service.get_token_for_project(project_id)
