@@ -17,26 +17,11 @@ from fastapi.responses import StreamingResponse
 
 from google.genai import types
 
-from app.core.config import genAI
-from app.core.env import settings
-from app.core.database import prisma, ensure_db_connected, get_checkpointer, get_memory_store
+from app.core.database import prisma, ensure_db_connected
 from app.middleware.auth_middleware import auth_middleware
 from app.domain.entities.auth.auth_schema import ApiResponse
 from prisma.enums import MessageRole
-
-from app.agents.supervisor.state import SupervisorState
-from app.agents.supervisor.orchestrator import (
-    build_supervisor_graph,
-    get_compiled_supervisor,
-    STYLE_PROMPTS,
-    SYSTEM_BASE_PROMPT
-)
-from app.agents.supervisor.context_budget import assemble_context_with_budget
-from app.agents.supervisor.metamo.shared import CognitiveState
-from app.agents.supervisor.metamo.controller import MetaMoController
-from app.agents.supervisor.metamo.homeostasis import post_turn_update
-from app.agents.supervisor.metamo.eval_logger import RunLogger
-from app.agents.memory.retriever import retrieve_memories, format_memories_for_prompt
+from app.agents.chat_agent import stream_chat_agent
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -78,6 +63,7 @@ class ThreadSummary(BaseModel):
 
 async def _get_or_create_thread(project_id: str, user_id: str, thread_id: Optional[str], initial_prompt: str):
     """Retrieves an existing ConversationThread or creates a new initialized one."""
+    await ensure_db_connected()
     if thread_id:
         existing = await prisma.conversationthread.find_unique(where={"id": thread_id})
         if existing and existing.projectId == project_id and existing.userId == user_id:
@@ -99,6 +85,7 @@ async def _get_or_create_thread(project_id: str, user_id: str, thread_id: Option
 
 async def _save_user_message(thread_id: str, content: str):
     """Creates a user message and queues vector embedding creation."""
+    await ensure_db_connected()
     msg = await prisma.chatmessage.create(
         data={
             "threadId": thread_id,
@@ -137,6 +124,7 @@ async def chat_with_project(
     Persists checkpoints to LangGraph AsyncPostgresSaver and episodic memory to Store.
     """
     try:
+        await ensure_db_connected()
         user_id = credentials.get("id") if credentials else None
         if not user_id:
             response.status_code = status.HTTP_401_UNAUTHORIZED
@@ -165,12 +153,25 @@ async def chat_with_project(
         supervisor_graph = await get_compiled_supervisor()
         config = {"configurable": {"thread_id": thread.id}}
 
+        user_profile = None
+        try:
+            user_rec = await prisma.user.find_unique(where={"id": user_id})
+            if user_rec:
+                user_profile = {
+                    "fullName": user_rec.fullName,
+                    "userName": user_rec.userName,
+                    "email": user_rec.email,
+                }
+        except Exception:
+            pass
+
         initial_state: SupervisorState = {
             "messages": [],
             "thread_id": thread.id,
             "project_id": project_id,
             "user_id": user_id,
             "user_query": body.prompt,
+            "user_profile": user_profile,
             "cognitive_state": cog_state_dict or CognitiveState().to_dict(),
             "current_signals": {},
             "deliberation_action": "",
@@ -189,6 +190,13 @@ async def chat_with_project(
         }
 
         result = await supervisor_graph.ainvoke(initial_state, config=config)
+
+        # Trigger autonomous background episodic memory consolidation
+        try:
+            from app.core.queue import enqueue_memory_consolidation
+            await enqueue_memory_consolidation(user_id=user_id, project_id=project_id, thread_id=thread.id)
+        except Exception as q_err:
+            logger.debug(f"Memory consolidation trigger deferred: {q_err}")
 
         resp_data = ChatResponseData(
             answer=result.get("final_response", ""),
@@ -219,9 +227,10 @@ async def stream_chat_with_project(
 ):
     """
     High-performance Server-Sent Events (SSE) streaming endpoint.
-    Emits metadata, token deltas, and completion events.
-    Deliberation telemetry is logged out-of-band to CSV/JSONL for developers.
+    Delegates context assembly, MetaMo deliberation, dynamic MCP tool execution,
+    model cascade streaming synthesis, and persistence to Hayyuu Chat Agent.
     """
+    await ensure_db_connected()
     user_id = credentials.get("id") if credentials else None
     if not user_id:
         return Response("Unauthorized", status_code=status.HTTP_401_UNAUTHORIZED)
@@ -233,218 +242,13 @@ async def stream_chat_with_project(
     thread = await _get_or_create_thread(project_id, user_id, body.threadId, body.prompt)
     await _save_user_message(thread.id, body.prompt)
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        t0 = time.time()
-        full_content_chunks: List[str] = []
-
-        try:
-            # 1. Immediate status: Context & Memory Retrieval
-            yield f"event: status\ndata: {json.dumps({'status': 'retrieving_context', 'message': 'Retrieving project memory and context...'})}\n\n"
-
-            memories = await retrieve_memories(user_id=user_id, project_id=project_id, query=body.prompt, limit=5)
-            budgeted = await assemble_context_with_budget(
-                thread_id=thread.id,
-                project_id=project_id,
-                user_query=body.prompt,
-                tier1_tokens=2000,
-                tier2_tokens=1500,
-                kg_tokens=1500,
-                semantic_search=True,
-                memories=memories,
-            )
-
-            # Load cognitive state
-            cog_state_dict = None
-            if thread.cognitiveState:
-                try:
-                    cog_state_dict = json.loads(thread.cognitiveState) if isinstance(thread.cognitiveState, str) else thread.cognitiveState
-                except Exception:
-                    pass
-            cog_state = cog_state_dict or CognitiveState().to_dict()
-
-            # 2. Status: MetaMo Cognitive Deliberation
-            yield f"event: status\ndata: {json.dumps({'status': 'deliberating', 'message': 'Analyzing query and selecting deliberation strategy...'})}\n\n"
-
-            controller = MetaMoController()
-            deliberation = await controller.deliberate(
-                user_query=body.prompt,
-                chat_history=budgeted.get("tier1_chat_history", []),
-                kg_context=budgeted.get("kg_context", ""),
-                state=cog_state
-            )
-
-            latency_ms = (time.time() - t0) * 1000.0
-
-            # 3. Log Evaluation Telemetry Out-of-Band (Zero DB Bloat)
-            try:
-                run_logger = RunLogger()
-                run_logger.log_turn(
-                    thread_id=thread.id,
-                    turn=int(cog_state.get("turn_count", 0)) + 1,
-                    query=body.prompt,
-                    action=deliberation["action"],
-                    style_modifier=deliberation["style_modifier"],
-                    score_top3=deliberation["score_top3"],
-                    reason=deliberation["reason"],
-                    cognitive_state=cog_state,
-                    latency_ms=latency_ms
-                )
-            except Exception as log_err:
-                logger.debug(f"Telemetry logging bypassed: {log_err}")
-
-            # 4. Emit SSE Metadata Event (Action & Style only, no internal telemetry)
-            meta_event = {
-                "thread_id": thread.id,
-                "action": deliberation["action"],
-                "style": deliberation["style_modifier"],
-                "fast_lane": deliberation["fast_lane"]
-            }
-            yield f"event: metadata\ndata: {json.dumps(meta_event)}\n\n"
-
-            # 5. Build Dynamic System Prompt with Action Directive, Style Modifier & Memory
-            style_key = deliberation["style_modifier"]
-            style_directive = STYLE_PROMPTS.get(style_key, STYLE_PROMPTS["style_balanced"])
-            kg_text = budgeted.get("kg_context", "")
-
-            action_key = deliberation.get("action", "act_respond_direct")
-            action_directive = ""
-            if action_key == "act_clarify":
-                action_directive = "\n\nACTION: Ambiguity is high. Ask 1-3 targeted, high-impact clarifying questions before taking irreversible actions."
-            elif action_key == "act_search":
-                action_directive = "\n\nACTION: Retrieve and ground facts from project specifications and documentation to address the user's technical inquiry."
-            elif action_key in ("act_extract_requirements", "act_plan_tasks", "act_decompose"):
-                action_directive = "\n\nACTION: Provide a structured breakdown of requirements or task plan for the engineering request."
-            elif action_key == "act_verify":
-                action_directive = "\n\nACTION: Perform rigorous verification and conflict detection across technical specifications."
-            elif action_key == "act_synthesize":
-                action_directive = "\n\nACTION: Synthesize complex requirements, architectural components, and data flows."
-
-            mem_formatted = format_memories_for_prompt(memories) if memories else ""
-            episodic_block = f"Long-Term User Preferences & Decisions:\n{mem_formatted}" if mem_formatted else ""
-
-            system_instruction = SYSTEM_BASE_PROMPT.format(
-                style_directive=style_directive,
-                domain_context=f"Domain Context:\n{kg_text}" if kg_text else "",
-                episodic_memory_context=episodic_block
-            ) + action_directive
-
-            # 6. Stream LLM Response with Model Fallback Cascade & Timeout
-            yield f"event: status\ndata: {json.dumps({'status': 'generating', 'message': 'Synthesizing response...'})}\n\n"
-
-            models_to_try = list(settings.GEMINI_MODELS) if settings.GEMINI_MODELS else [
-                "gemini-3.8-flash",
-                "gemini-3.5-flash",
-                "gemini-4-argon",
-                "gemini-3.5-flash-lite",
-                "gemini-3.1-flash-lite",
-                "gemini-3.8-live",
-                "gemini-2.5-flash-lite",
-            ]
-            stream_success = False
-            last_stream_err = None
-
-            for model_name in models_to_try:
-                try:
-                    logger.info(f"Initiating stream with model: {model_name}")
-                    stream_coro = genAI.aio.models.generate_content_stream(
-                        model=model_name,
-                        contents=[body.prompt],
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            temperature=0.3,
-                        )
-                    )
-                    # Bounded with 45s connection timeout
-                    response_stream = await asyncio.wait_for(stream_coro, timeout=45.0)
-
-                    # Iterate chunks with per-chunk timeout
-                    stream_iter = response_stream.__aiter__()
-                    while True:
-                        try:
-                            chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=45.0)
-                        except StopAsyncIteration:
-                            break
-                        if chunk.text:
-                            full_content_chunks.append(chunk.text)
-                            token_event = {"delta": chunk.text}
-                            yield f"event: token\ndata: {json.dumps(token_event)}\n\n"
-
-                    if full_content_chunks:
-                        stream_success = True
-                        break
-                except Exception as stream_err:
-                    last_stream_err = stream_err
-                    logger.warning(f"Streaming error with model {model_name}: {stream_err}")
-                    if full_content_chunks:
-                        # Some chunks were already yielded, avoid duplicate text
-                        stream_success = True
-                        break
-                    yield f"event: status\ndata: {json.dumps({'status': 'retrying', 'message': f'Model {model_name} busy, trying backup model...'})}\n\n"
-
-            if not stream_success:
-                logger.error(f"All Gemini models failed to stream content: {last_stream_err}")
-                error_msg = f"Unable to stream response from AI model ({last_stream_err}). Please retry."
-                yield f"event: error\ndata: {json.dumps({'error': error_msg})}\n\n"
-                return
-
-            full_response = "".join(full_content_chunks)
-
-            # 7. Post-Turn Drive & Homeostasis Update
-            updated_cog_state = post_turn_update(
-                state=cog_state,
-                signals=deliberation["signals"],
-                decision={"action": deliberation["action"], "style_modifier": deliberation["style_modifier"]},
-                turn_success=True
-            )
-
-            # Re-ensure PostgreSQL connection is active before persisting
-            await ensure_db_connected()
-
-            # Persist thread state and assistant message (zero DB bloat: no telemetry in ChatMessage)
-            await prisma.conversationthread.update(
-                where={"id": thread.id},
-                data={"cognitiveState": json.dumps(updated_cog_state)}
-            )
-
-            created_msg = await prisma.chatmessage.create(
-                data={
-                    "threadId": thread.id,
-                    "role": MessageRole.ASSISTANT,
-                    "content": full_response,
-                    "cognitiveAction": deliberation["action"],
-                    "styleModifier": deliberation["style_modifier"],
-                }
-            )
-
-            # Generate embedding in background
-            try:
-                from app.infrastructure.ai.gemini_embedder import GeminiEmbedder
-                embedder = GeminiEmbedder()
-                vec = embedder.embed_text(full_response, user_query=False)
-                vec_lit = "[" + ",".join(str(x) for x in vec) + "]"
-                await prisma.execute_raw(
-                    f'UPDATE chat_messages SET embedding = \'{vec_lit}\'::vector WHERE id = $1;',
-                    created_msg.id
-                )
-            except Exception:
-                pass
-
-            # 8. Emit SSE Completion Event
-            complete_event = {
-                "thread_id": thread.id,
-                "message_id": created_msg.id,
-                "turn": updated_cog_state.get("turn_count", 1),
-                "status": "completed"
-            }
-            yield f"event: complete\ndata: {json.dumps(complete_event)}\n\n"
-
-        except Exception as e:
-            logger.error(f"Error in SSE stream generation: {e}")
-            error_event = {"error": str(e)}
-            yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
-
     return StreamingResponse(
-        event_generator(),
+        stream_chat_agent(
+            project_id=project_id,
+            user_id=user_id,
+            thread_id=thread.id,
+            prompt=body.prompt
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

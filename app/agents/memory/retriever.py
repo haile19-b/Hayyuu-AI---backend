@@ -39,16 +39,42 @@ async def retrieve_memories(
     project_id: Optional[str] = None,
     query: Optional[str] = None,
     memory_type: Optional[str] = None,
-    limit: int = 5
+    limit: int = 10
 ) -> List[Dict[str, Any]]:
     """
     Retrieves relevant long-term episodic memories for a user and optional project scope.
     Combines LangGraph Store namespace retrieval with Prisma MemoryRecord tracking.
+    Guarantees user profile identity memories (profile/*) are prioritized in context.
     """
     memories: List[Dict[str, Any]] = []
     seen_keys = set()
 
-    # 1. Attempt LangGraph Postgres Store retrieval across scopes
+    # 1. Always prioritize user profile and identity memories (name, assignment, role)
+    try:
+        profile_records = await prisma.memoryrecord.find_many(
+            where={
+                "userId": user_id,
+                "key": {"startswith": "profile/"}
+            },
+            order={"importance": "desc"},
+            take=5
+        )
+        for prec in profile_records:
+            if prec.key not in seen_keys:
+                seen_keys.add(prec.key)
+                memories.append({
+                    "id": prec.id,
+                    "key": prec.key,
+                    "content": prec.content,
+                    "type": prec.type.value if hasattr(prec.type, "value") else str(prec.type),
+                    "importance": prec.importance,
+                    "access_count": prec.accessCount,
+                    "source": "memory_record_profile",
+                })
+    except Exception as prof_err:
+        logger.debug(f"Profile memories lookup deferred: {prof_err}")
+
+    # 2. Attempt LangGraph Postgres Store retrieval across scopes
     try:
         store = await get_memory_store()
         if store is not None and query and query.strip():
@@ -78,7 +104,7 @@ async def retrieve_memories(
     except Exception as store_err:
         logger.debug(f"LangGraph Store search bypassed or returned no matches: {store_err}")
 
-    # 2. Relational fallback / complement from Prisma MemoryRecord
+    # 3. Relational fallback / complement from Prisma MemoryRecord
     try:
         where: Dict[str, Any] = {"userId": user_id}
         if project_id:
@@ -92,7 +118,7 @@ async def retrieve_memories(
         records = await prisma.memoryrecord.find_many(
             where=where,
             order={"importance": "desc"},
-            take=limit * 2
+            take=max(limit * 2, 10)
         )
 
         for rec in records:

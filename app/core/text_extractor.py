@@ -107,7 +107,7 @@ def extract_text_from_pdf_digital(file_bytes: bytes) -> str:
 
 
 async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
-    """Call Gemini to extract text from scanned PDFs or images using the google-genai SDK."""
+    """Call Gemini to extract text from scanned PDFs or images using the unified AI cascade."""
     try:
         prompt = (
             "You are a document transcription system. Extract and transcribe all the textual content "
@@ -121,14 +121,13 @@ async def extract_text_via_gemini(file_bytes: bytes, mime_type: str) -> str:
             mime_type=mime_type
         )
         
-        def _generate():
-            response = genAI.models.generate_content(
-                model="gemini-3.8-flash",
-                contents=[binary_part, prompt]
-            )
-            return response.text
-            
-        return await anyio.to_thread.run_sync(_generate)
+        from app.core.ai_cascade import generate_content_cascade
+        response = await generate_content_cascade(
+            contents=[binary_part, prompt],
+            config=types.GenerateContentConfig(temperature=0.0),
+            timeout_seconds=45.0,
+        )
+        return response.text or ""
     except Exception as e:
         logger.error(f"Error performing OCR text extraction via Gemini: {e}")
         raise e

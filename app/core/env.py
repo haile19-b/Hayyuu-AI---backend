@@ -14,17 +14,9 @@ class Settings(BaseSettings):
     GEMINI_API_KEY: str | None = None
     GEMINI_MODELS: list[str] = [
         # Flagship / Workhorse Production Models
-        "gemini-3.8-flash",
         "gemini-3.5-flash",
-        # Frontier & Advanced Reasoning
-        "gemini-4-argon",
-        # Cost & Latency Optimized (Lite)
         "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        # Live & Real-Time Orchestration
-        "gemini-3.8-live",
-        # Legacy / Active Transition (Limited API Access)
-        "gemini-2.5-flash-lite",
+        "gemini-3.8-flash",
     ]
     MAX_FORM_SIZE_MB: int = 50
     ENABLE_EMBEDDED_WORKER: bool = False
@@ -92,9 +84,11 @@ class Settings(BaseSettings):
         
         # Ensure serverless-friendly connection pool parameters for Prisma
         if "pool_timeout" not in query_params:
-            query_params["pool_timeout"] = ["30"]
+            query_params["pool_timeout"] = ["20"]
         if "connection_limit" not in query_params:
             query_params["connection_limit"] = ["10"]
+        if "connect_timeout" not in query_params:
+            query_params["connect_timeout"] = ["15"]
             
         flat_params = {k: v[0] for k, v in query_params.items()}
         new_query = urllib.parse.urlencode(flat_params)

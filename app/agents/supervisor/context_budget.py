@@ -13,6 +13,63 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def format_history_for_genai(
+    tier1_messages: List[Dict[str, Any]],
+    current_prompt: str
+) -> List[Any]:
+    """
+    Transforms chronological chat history into Gemini-compatible types.Content objects.
+    Ensures alternating user/model roles and terminates with the active user prompt.
+    """
+    from google.genai import types
+    contents: List[types.Content] = []
+
+    history = [m for m in tier1_messages if isinstance(m, dict)]
+    # If the newest message in history is the just-saved current prompt, pop it to cleanly place as final turn
+    if history and history[-1].get("role", "").upper() == "USER" and history[-1].get("content", "").strip() == current_prompt.strip():
+        history.pop()
+
+    last_role = None
+    for msg in history:
+        raw_role = msg.get("role", "USER").upper()
+        genai_role = "user" if raw_role == "USER" else "model"
+        text = (msg.get("content") or "").strip()
+        if not text:
+            continue
+
+        # Merge consecutive identical roles to adhere to strict GenAI alternating constraints
+        if genai_role == last_role and contents:
+            prev_parts = contents[-1].parts
+            if prev_parts:
+                prev_text = getattr(prev_parts[0], "text", "") or ""
+                contents[-1].parts = [types.Part.from_text(text=f"{prev_text}\n\n{text}")]
+            continue
+
+        contents.append(
+            types.Content(
+                role=genai_role,
+                parts=[types.Part.from_text(text=text)]
+            )
+        )
+        last_role = genai_role
+
+    # Append current user prompt as the final turn
+    if last_role == "user" and contents:
+        prev_parts = contents[-1].parts
+        if prev_parts:
+            prev_text = getattr(prev_parts[0], "text", "") or ""
+            contents[-1].parts = [types.Part.from_text(text=f"{prev_text}\n\n{current_prompt}")]
+    else:
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=current_prompt)]
+            )
+        )
+
+    return contents
+
+
 async def assemble_context_with_budget(
     thread_id: str,
     project_id: str,
@@ -161,16 +218,98 @@ async def assemble_context_with_budget(
     q_lower = user_query.lower() if user_query else ""
 
     try:
-        # Base Anchor: Project Overview (<200 tokens) - Always Included
-        project = await prisma.project.find_unique(where={"id": project_id})
+        # Base Anchor: Project Overview, Connected Repositories & Documents - Always Included
+        project = await prisma.project.find_unique(
+            where={"id": project_id},
+            include={
+                "repositories": True,
+                "documents": True,
+            }
+        )
         if project:
-            base_anchor = (
-                f"[Project Anchor: {project.name}]\n"
+            anchor_lines = [
+                f"[Project Anchor: {project.name}]",
                 f"Status: {project.status} | Description: {project.description or 'N/A'}"
-            )
+            ]
+            if project.repositories:
+                repos_summary = ", ".join([
+                    f"{r.fullName} (URL: {r.htmlUrl}, Branch: {r.defaultBranch}, Active: {r.isActive})"
+                    for r in project.repositories
+                ])
+                anchor_lines.append(f"Connected GitHub Repositories: {repos_summary}")
+            else:
+                anchor_lines.append("Connected GitHub Repositories: None")
+
+            if project.documents:
+                docs_summary = ", ".join([
+                    f"'{d.name}' ({d.fileType}, Status: {d.status})"
+                    for d in project.documents
+                ])
+                anchor_lines.append(f"Uploaded Documents: {docs_summary}")
+            else:
+                anchor_lines.append("Uploaded Documents: None")
+
+            base_anchor = "\n".join(anchor_lines)
             base_tokens = estimate_tokens(base_anchor)
             kg_context_parts.append(base_anchor)
             kg_token_count += base_tokens
+
+        # Intent Gating: Repositories & Codebase (Included for repo/github/git/code queries)
+        should_include_repos = (
+            "repo" in q_lower
+            or "github" in q_lower
+            or "git" in q_lower
+            or "codebase" in q_lower
+            or "branch" in q_lower
+            or "commit" in q_lower
+            or "pull request" in q_lower
+            or "pr" in q_lower
+        )
+        if should_include_repos:
+            repos = await prisma.projectrepository.find_many(
+                where={"projectId": project_id}
+            )
+            if repos:
+                repo_lines = ["[Connected GitHub Repositories Details]"]
+                for r in repos:
+                    repo_lines.append(
+                        f"- Repository [{r.fullName}]:\n"
+                        f"  URL: {r.htmlUrl}\n"
+                        f"  Owner: {r.owner}\n"
+                        f"  Name: {r.name}\n"
+                        f"  Default Branch: {r.defaultBranch}\n"
+                        f"  Active Status: {'Active' if r.isActive else 'Inactive'}"
+                    )
+                r_text = "\n".join(repo_lines)
+                r_tokens = estimate_tokens(r_text)
+                if kg_token_count + r_tokens <= kg_tokens:
+                    kg_context_parts.append(r_text)
+                    kg_token_count += r_tokens
+
+        # Intent Gating: Uploaded Documents & Specifications
+        should_include_docs = (
+            "document" in q_lower
+            or "doc" in q_lower
+            or "file" in q_lower
+            or "pdf" in q_lower
+            or "spec" in q_lower
+            or "srs" in q_lower
+        )
+        if should_include_docs:
+            docs = await prisma.document.find_many(
+                where={"projectId": project_id},
+                take=10,
+                order={"createdAt": "desc"}
+            )
+            if docs:
+                doc_lines = ["[Uploaded Project Documents Index]"]
+                for d in docs:
+                    doc_lines.append(f"- Document [{d.id[:8]}] '{d.name}': Status={d.status}, Type={d.fileType}, Size={d.sizeBytes} bytes")
+                d_text = "\n".join(doc_lines)
+                d_tokens = estimate_tokens(d_text)
+                if kg_token_count + d_tokens <= kg_tokens:
+                    kg_context_parts.append(d_text)
+                    kg_token_count += d_tokens
 
         # Intent Gating: Active Conflicts (Included for act_verify or conflict queries)
         should_include_conflicts = (

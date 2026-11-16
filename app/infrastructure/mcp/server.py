@@ -48,7 +48,7 @@ def create_mcp_server(name: str = "hayyuu-mcp") -> MCPServer:
     Factory function instantiating and configuring a production-ready MCPServer
     with Tools, Resources, and Prompts.
     """
-    server = MCPServer(name, lifespan=app_lifespan)
+    server = MCPServer(name)
 
     # 1. Register Database & Graph Tools
     register_db_graph_tools(server)

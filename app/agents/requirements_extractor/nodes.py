@@ -148,7 +148,7 @@ async def extract_requirements_node(state: DocumentAnalysisState) -> dict:
     
     for req in reqs:
         # Map requirement type 
-        req_type = RequirementType.FUNCTIONAL if req.get("type") == "NON_FUNCTIONAL" else RequirementType.NON_FUNCTIONAL
+        req_type = RequirementType.NON_FUNCTIONAL if req.get("type") == "NON_FUNCTIONAL" else RequirementType.FUNCTIONAL
             
         # Map requirement priority
         priority_str = req.get("priority", "P2").upper()

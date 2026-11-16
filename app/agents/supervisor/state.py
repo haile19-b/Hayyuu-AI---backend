@@ -20,6 +20,7 @@ class SupervisorState(TypedDict):
     project_id: str
     user_id: str
     user_query: str
+    user_profile: Optional[Dict[str, Any]]
 
     # MetaMo Cognitive Deliberation State
     cognitive_state: Dict[str, Any]
